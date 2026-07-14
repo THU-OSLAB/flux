@@ -1,0 +1,2 @@
+libflux-y += init.o config.o elf.o oci.o vdso.o
+libflux-$(CONFIG_FLUX_MPK) += mpk.o

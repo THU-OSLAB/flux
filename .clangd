@@ -1,0 +1,4 @@
+CompileFlags:
+  Remove:
+    - -fno-allow-store-data-races
+    - -fconserve-stack

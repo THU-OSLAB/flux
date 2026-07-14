@@ -1,0 +1,6 @@
+{
+  "cpu_range": "1-4",
+  "nic_pci_addr": "0000:17:00.0",
+  "mtu": 1500,
+  "tx_chksum_offload": true
+}

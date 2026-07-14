@@ -1,0 +1,16 @@
+[submodule "third-party/rdma-core"]
+	path = third-party/rdma-core
+	url = https://github.com/FastLKL/rdma-core.git
+	branch = fastlkl
+[submodule "third-party/dpdk"]
+	path = third-party/dpdk
+	url = https://github.com/FastLKL/dpdk.git
+	branch = fastlkl
+[submodule "third-party/spdk"]
+	path = third-party/spdk
+	url = https://github.com/FastLKL/spdk.git
+	branch = fastlkl
+[submodule "third-party/glibc"]
+	path = third-party/glibc
+	url = https://github.com/FastLKL/glibc.git
+	branch = fastlkl

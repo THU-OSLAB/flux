@@ -1,0 +1,2 @@
+iokd-y += main.o config.o kmod.o uintr.o client.o timer.o
+iokd-$(CONFIG_FLUX_FNET) += fnet.o dma.o rx.o tx.o

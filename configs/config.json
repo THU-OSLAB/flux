@@ -1,0 +1,15 @@
+{
+    "mem_size": "256M",
+    "ld_path": "/third-party/install/lib/ld-linux-x86-64.so.2",
+    "env": [
+        "LANG=C.UTF-8",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "LD_LIBRARY_PATH=/third-party/install/lib:/lib/x86_64-linux-gnu:/usr/lib:/usr/lib64:/usr/lib/x86_64-linux-gnu:/usr/local/lib"
+    ],
+    "hostfs_mounts": [
+        "/lib:/lib",
+        "/bin:/bin",
+        "/usr:/usr",
+        "/etc:/etc"
+    ]
+}

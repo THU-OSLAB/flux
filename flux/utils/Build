@@ -1,0 +1,3 @@
+libflux-y += error.o fs.o log.o path.o sysctl.o lrpc.o
+
+libflux-$(CONFIG_FLUX_FNET) += net.o

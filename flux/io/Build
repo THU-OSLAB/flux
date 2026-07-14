@@ -1,0 +1,3 @@
+libflux-y += iok_client.o
+libflux-$(CONFIG_FLUX_FNET) += iok_netdev.o
+libflux-$(CONFIG_FLUX_SPDK) += spdk.o

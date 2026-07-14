@@ -1,0 +1,44 @@
+# Common generated build artifacts
+*.a
+*.cmd
+*.config
+*.conf
+*.d
+*.i
+*.ko
+*.o
+*.o.*
+*.pyc
+*.s
+*.so
+*.so.dbg
+*.su
+*~
+\#*#
+Module.symvers
+modules.order
+
+# Project-local generated files
+/Build
+/build/
+/compile_commands.json
+/include/autoconf.h
+/include/kernel/
+/kmod/.cache/
+/kmod/compile_commands.json
+/kmod/*.mod
+/kmod/*.mod.c
+/scripts/force_rmmod/*.mod
+/scripts/force_rmmod/*.mod.c
+
+# Local/generated JSON files, but keep checked-in configs
+/*.json
+!/default_config.json
+!/configs/*
+
+# Local prompt workspace
+.codex
+/prompt
+/.prompt
+/.humanize
+/.qoder

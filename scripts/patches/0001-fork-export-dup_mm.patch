@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 15 Apr 2026 00:00:00 +0800
+Subject: [PATCH] fork: export dup_mm for Flux kmod
+
+Make dup_mm visible to GPL modules so Flux can keep resolving it through
+kallsyms on stock module code paths.
+---
+kernel/fork.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/fork.c b/kernel/fork.c
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1668,7 +1668,7 @@ mm_release(tsk, mm);
+  *
+  * Return: the duplicated mm or NULL on failure.
+  */
+-static struct mm_struct *dup_mm(struct task_struct *tsk,
++struct mm_struct *dup_mm(struct task_struct *tsk,
+ 				struct mm_struct *oldmm)
+ {
+ 	struct mm_struct *mm;
+@@ -1703,6 +1703,8 @@ free_pt:
+ 
+ fail_nomem:
+ 	return NULL;
+ }
++EXPORT_SYMBOL_GPL(dup_mm);
++
+ 
+ static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
+-- 
+2.43.0

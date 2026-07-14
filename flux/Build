@@ -1,0 +1,14 @@
+flux-y += flux.o
+flux-runc-$(CONFIG_FLUX_RUNC) += runc.o
+iokd-y += iokd/
+iokd-y += utils/log.o
+iokd-y += utils/lrpc.o
+iokd-y += utils/path.o
+
+libflux-y += core/
+libflux-y += launch.o
+libflux-y += io/
+libflux-y += runc/
+libflux-y += utils/
+
+libflux-$(CONFIG_FLUX_POSIX) += host/
