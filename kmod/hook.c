@@ -1,44 +1,15 @@
 #define pr_fmt(fmt) "flux_hook: " fmt
 
 #include <linux/ftrace.h>
-#include <linux/kallsyms.h>
-#include <linux/kprobes.h>
 #include <linux/module.h>
-#include <linux/version.h>
 #include <asm/unistd.h>
 
 #include "hook.h"
 #include "mm.h"
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
-typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
-static kallsyms_lookup_name_t flux_kallsyms_lookup_name;
-#endif
-
 int flux_hook_init(void)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
-	struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
-	int err;
-
-	err = register_kprobe(&kp);
-	if (err)
-		return err;
-	flux_kallsyms_lookup_name = (kallsyms_lookup_name_t)kp.addr;
-	unregister_kprobe(&kp);
-	if (!flux_kallsyms_lookup_name)
-		return -ENXIO;
-#endif
-	return 0;
-}
-
-unsigned long flux_lookup_symbol(const char *name)
-{
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
-	return flux_kallsyms_lookup_name ? flux_kallsyms_lookup_name(name) : 0;
-#else
-	return kallsyms_lookup_name(name);
-#endif
+	return flux_compat_symbols_init();
 }
 
 static int flux_resolve_hook(struct flux_ftrace_hook *hook)

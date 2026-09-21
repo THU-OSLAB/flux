@@ -66,4 +66,10 @@
 
 #define EX_TYPE_ZEROPAD			20 /* longword load with zeropad on fault */
 
+/* CMP residual read: AX := 0, DX := fault address, CX := error | BIT(63). */
+#define EX_TYPE_FLUX_MPK_READ		21
+
+/* I/O transfer: R8 := fault address, R9 := error, R10 := trap | BIT(63). */
+#define EX_TYPE_FLUX_IOPORT		22
+
 #endif /* _ASM_FLUX_EXTABLE_FIXUP_TYPES_H */

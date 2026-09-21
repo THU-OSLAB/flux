@@ -805,10 +805,14 @@ static inline void mm_free_pgd(struct mm_struct *mm)
 #else
 static int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 {
+	int ret;
+
 	mmap_write_lock(oldmm);
 	dup_mm_exe_file(mm, oldmm);
 	mmap_write_unlock(oldmm);
-	return 0;
+
+	ret = arch_dup_mmap(oldmm, mm);
+	return ret;
 }
 #define mm_alloc_pgd(mm)	(0)
 #define mm_free_pgd(mm)

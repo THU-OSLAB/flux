@@ -62,7 +62,7 @@ int flux_dirfd(struct flux_dir *dir);
  */
 int flux_mount_fs(char *fstype);
 
-/* Recursively create a directory path inside the guest filesystem. */
+/* Recursively create a directory path inside the Flux filesystem. */
 int flux_mkdir_p(const char *path, flux_mode_t mode);
 
 /* Ensure the target exists, then perform the mount. */

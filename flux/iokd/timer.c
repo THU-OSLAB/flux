@@ -5,6 +5,7 @@
 #include "iokd.h"
 
 #define FLUX_IOKD_TIMER_POLL_NS 10000
+#define FLUX_IOKD_TIMER_RETRY_NS NSEC_PER_MSEC
 
 bool flux_iokd_timers_run(void)
 {
@@ -29,12 +30,28 @@ bool flux_iokd_timers_run(void)
 		timers = client->timer_base;
 		for (j = 0; j < client->nr_cpus; j++) {
 			uint64_t deadline;
+			uint64_t deadline_ns;
+			uint64_t retry_deadline;
 
 			deadline = atomic_load_acquire(&timers[j].deadline_ns);
-			if (!deadline || deadline > now)
+			if (!deadline)
 				continue;
+
+			deadline_ns =
+				deadline & ~FLUX_IOK_TIMER_DELIVERY_PENDING;
+			if (deadline_ns > now)
+				continue;
+
+			/*
+			 * Keep an expired timer armed until the Flux IRQ handler claims
+			 * it. A retry marker prevents a delayed duplicate UINTR from
+			 * clearing a newer deadline installed by Flux.
+			 */
+			retry_deadline = (now + FLUX_IOKD_TIMER_RETRY_NS) |
+				FLUX_IOK_TIMER_DELIVERY_PENDING;
 			if (!atomic_cmpxchg_acq_rel_acquire(&timers[j].deadline_ns,
-							   &deadline, 0))
+							   &deadline,
+							   retry_deadline))
 				continue;
 
 			flux_iokd_notify_timer(client, j);

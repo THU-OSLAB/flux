@@ -22,6 +22,7 @@ void flux_iok_client_fini(void);
 bool flux_iok_client_is_enabled(void);
 bool flux_iok_client_has_network(void);
 int flux_iok_client_fill_netdev(struct flux_fnet_netdev *dev);
+int flux_iok_client_activate_netdev(void);
 const char *flux_iok_sock_path(void);
 void *flux_iok_client_dma_alloc(void *hint, size_t len, size_t pgsize,
 				int node);

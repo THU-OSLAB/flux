@@ -2,6 +2,8 @@
 #ifndef _ASM_X86_STAT_H
 #define _ASM_X86_STAT_H
 
+#define STAT_HAVE_NSEC 1
+
 struct stat {
 	unsigned long long st_dev;
 	unsigned long long st_ino;

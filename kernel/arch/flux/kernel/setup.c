@@ -1,6 +1,8 @@
 #include <linux/memory.h>
 #include <linux/kernel.h>
 #include <linux/binfmts.h>
+#include <linux/coredump.h>
+#include <linux/sched/coredump.h>
 #include <linux/init.h>
 #include <linux/init_task.h>
 #include <linux/personality.h>
@@ -8,12 +10,13 @@
 #include <linux/reboot.h>
 #include <linux/start_kernel.h>
 #include <linux/sched.h>
+#include <linux/signal.h>
 #include <linux/syscalls.h>
+#include <linux/device.h>
 #include <uapi/linux/sched/types.h>
 #include <linux/tick.h>
 #include <linux/memblock.h>
 #include <asm/host_ops.h>
-#include <asm/irq.h>
 #include <asm/unistd.h>
 #include <asm/setup.h>
 #include <asm/syscalls.h>
@@ -23,23 +26,25 @@
 #include <asm/flux_ops.h>
 #include <asm/host_dev.h>
 #include <asm/signal.h>
+#include <asm/vdso.h>
 
 #include <asm/x86/tsc.h>
 
-#ifdef CONFIG_FLUX_UINTR
 #include <asm/x86/uintr.h>
 
 extern struct flux_uipi_pcpu flux_uipi[NR_CPUS];
-#endif
 
 int is_running;
 
 struct flux_host_operations *flux_ops __read_mostly;
 unsigned long *flux_host_fsbases __read_mostly;
-void *flux_vvar_data __read_mostly;
 struct flux_spdk *flux_spdk __read_mostly;
 struct flux_spdk_operations *flux_spdk_ops __read_mostly;
 static void (*flux_main_entry)(void *);
+const char *flux_elf_interpreter;
+unsigned long flux_elf_hwcap, flux_elf_hwcap2;
+
+static unsigned int flux_nr_cpus __initdata = NR_CPUS;
 
 static char cmd_line[COMMAND_LINE_SIZE];
 static char *cmd_line_ptr __initdata = boot_command_line;
@@ -70,7 +75,7 @@ static int __init setup_dma_size(char *str)
 {
 #ifdef CONFIG_ZONE_DMA
 	dma_size = memparse(str, NULL);
-	if (dma_size < MIN_MEMORY_BLOCK_SIZE)
+	if (dma_size && dma_size < MIN_MEMORY_BLOCK_SIZE)
 		dma_size = MIN_MEMORY_BLOCK_SIZE;
 #endif
 	return 0;
@@ -90,10 +95,11 @@ void __init setup_arch(char **cl)
 	parse_early_param();
 
 	reset_cpu_possible_mask();
-	for (i = 0; i < NR_CPUS; i++)
+	for (i = 0; i < flux_nr_cpus; i++)
 		set_cpu_possible(i, true);
 
 	bootmem_init(mem_size, dma_size);
+	flux_vdso_init();
 	misc_mem_init();
 }
 
@@ -144,17 +150,10 @@ static void flux_uintr_init_ipi(int cpu)
 {
 	while (!flux_ops)
 		cpu_relax();
-#ifdef CONFIG_FLUX_UINTR
-#ifdef CONFIG_FLUX_IPI_GATE
-	flux_ops->uintr_register_ipi(cpu, 0);
-#else
-	flux_ops->uintr_register_ipi(cpu, FLUX_IPI_EXIT);
 	flux_ops->uintr_register_ipi(cpu, FLUX_IPI_RESCHED);
 	flux_ops->uintr_register_ipi(cpu, FLUX_IPI_CALLFUNC);
 	flux_ops->uintr_register_ipi(cpu, FLUX_IPI_TICKBC);
 	flux_ops->uintr_register_ipi(cpu, FLUX_IPI_SHUTDOWN);
-#endif
-#endif
 }
 
 void __init __noreturn flux_start_kernel(struct flux_host_info *host,
@@ -165,10 +164,15 @@ void __init __noreturn flux_start_kernel(struct flux_host_info *host,
 
 	/* init host ops */
 	flux_ops = host->ops;
+	flux_elf_interpreter = host->elf_interpreter;
+	flux_elf_hwcap = host->hwcap;
+	flux_elf_hwcap2 = host->hwcap2;
+	if (host->nr_cpus < 1 || host->nr_cpus > NR_CPUS)
+		panic("invalid Flux CPU count %d (expected 1..%d)",
+		      host->nr_cpus, NR_CPUS);
+	flux_nr_cpus = host->nr_cpus;
+
 	flux_host_fsbases = host->fsbases;
-	flux_vvar_data = host->vvar;
-	if (!flux_vvar_data)
-		panic("missing Flux vvar writer mapping");
 #ifdef CONFIG_FLUX_SPDK
 	flux_spdk = host->spdk;
 	flux_spdk_ops = &flux_spdk->ops;
@@ -195,10 +199,7 @@ void __init __noreturn flux_start_kernel(struct flux_host_info *host,
 	va_end(ap);
 	memcpy(cmd_line, boot_command_line, COMMAND_LINE_SIZE);
 
-#ifdef CONFIG_SMP
-	/* init stat */
-	memset(pcpu_stat, 0, sizeof(pcpu_stat));
-#else
+#ifndef CONFIG_SMP
 	tls_pcpu.cpu_number = 0;
 	tls_pcpu.host_tid = flux_ops_gettid_raw();
 #endif
@@ -206,16 +207,19 @@ void __init __noreturn flux_start_kernel(struct flux_host_info *host,
 	/* init uintr ipi */
 	flux_uintr_init_ipi(0);
 
+#ifdef CONFIG_SMP
 	early_per_cpu(init_done, 0) = true;
-	for (i = 1; i < NR_CPUS; i++) {
+	for (i = 1; i < flux_nr_cpus; i++) {
 		while (!early_per_cpu(init_done, i))
 			cpu_relax();
 	}
+#else
+	early_per_cpu(init_done, 0) = true;
+#endif
 
 	/* copy uipi info after all init done */
-#ifdef CONFIG_FLUX_UINTR
-	memcpy(&flux_uipi, host->uipi, sizeof(struct flux_uipi_pcpu) * NR_CPUS);
-#endif
+	memcpy(&flux_uipi, host->uipi,
+	       sizeof(struct flux_uipi_pcpu) * flux_nr_cpus);
 
 	start_kernel();
 }
@@ -285,10 +289,20 @@ struct mm_struct *main_mm = NULL;
 
 static int main_entry_wrapper(void *unused)
 {
+	struct thread_info *ti = current_thread_info();
+
+	set_ti_thread_flag(ti, TIF_USER);
 	/* kernel_thread() marks the child even when its parent was normalized. */
 	current->flags &= ~PF_KTHREAD;
 
-	/* now we first enter user mode */
+	/*
+	 * host->main runs Flux Env code with the userspace ABI but kernel PKRU.
+	 * Keep UINTR disabled through runtime setup. flux_kernel_exec() enters
+	 * Linux exec and completes the transition through the arch return path.
+	 */
+	arch_local_irq_disable();
+
+	/* Runtime setup uses the environment syscall entry convention. */
 	this_cpu_write(tls_pcpu.in_kernel, false);
 
 	pr_info("starting main entry\n");
@@ -304,7 +318,7 @@ int init(void *unused)
 	struct rlimit rlim;
 	struct task_struct *tsk = current;
 	pid_t pid;
-	int ret = 0, stat;
+	int ret = 0, stat = 0;
 
 	if (!flux_main_entry)
 		return -EINVAL;
@@ -321,6 +335,14 @@ int init(void *unused)
 	mmget(main_mm);
 	tsk->mm = main_mm;
 	tsk->active_mm = main_mm;
+	set_binfmt(&flux_run_init_binfmt);
+	set_dumpable(main_mm, SUID_DUMP_USER);
+#ifdef CONFIG_SCHED_MM_CID
+	tsk->mm_cid = -1;
+	tsk->last_mm_cid = -1;
+	tsk->mm_cid_active = 0;
+	tsk->migrate_from_cpu = -1;
+#endif
 	sched_mm_cid_fork(tsk);
 
 	/* set flag for interrupt handler */
@@ -368,6 +390,8 @@ int init(void *unused)
 		goto out;
 	}
 
+	ret = stat;
+
 out:
 	flux_signal_unregister_init_task(current);
 
@@ -376,11 +400,12 @@ out:
 
 static int flux_run_init(struct linux_binprm *bprm)
 {
-	int ret, stat;
+	struct ksignal ksig;
+	int ret, stat = 0;
 	pid_t pid;
 
 	if (strcmp("/init", bprm->filename) != 0)
-		return -EINVAL;
+		return -ENOEXEC;
 
 	ret = begin_new_exec(bprm);
 	if (ret)
@@ -402,13 +427,28 @@ static int flux_run_init(struct linux_binprm *bprm)
 		machine_halt();
 	}
 
-	/* wait task exit */
-	ret = kernel_wait(pid, &stat);
+	/*
+	 * This is the global PID 1 task and never returns to userspace after the
+	 * Flux binfmt takes over.  Service ptrace/job-control state explicitly
+	 * when its wait is interrupted, then resume waiting for the Flux init
+	 * task.  Fatal default actions are handled inside get_signal().
+	 */
+	for (;;) {
+		ret = kernel_wait(pid, &stat);
+		if (ret != -ERESTARTSYS)
+			break;
+		if (get_signal(&ksig)) {
+			ret = -EINTR;
+			break;
+		}
+	}
+
 	if (ret < 0) {
 		pr_err("wait init failed: %d\n", ret);
 		machine_halt();
 	}
 
+	flux_exec_record_init_status(stat);
 	pr_info("init exited with %d\n", stat);
 
 	machine_halt();
@@ -421,6 +461,7 @@ static int flux_run_init(struct linux_binprm *bprm)
 static int __init fs_setup(void)
 {
 	int fd;
+	int ret;
 
 	// Pad '/init' to make sure it's 8 bytes, otherwise KASan would
 	// emit an error. The kernel's strncpy implementation attempts to read
@@ -429,6 +470,10 @@ static int __init fs_setup(void)
 	fd = sys_open("/init\0\0", O_CREAT, 0700);
 	WARN_ON(fd < 0);
 	sys_close(fd);
+
+	ret = devtmpfs_mount();
+	if (ret && ret != -EINVAL)
+		pr_warn("failed to mount devtmpfs: %d\n", ret);
 
 	register_binfmt(&flux_run_init_binfmt);
 

@@ -2,6 +2,7 @@
 #define _FLUX_RUNTIME_H
 
 #include <flux/base.h>
+#include <kernel/asm/flux_oci.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,7 +12,7 @@ extern "C" {
 #define FLUX_BOOT_CMDLINE_SIZE 4096
 
 #define FLUX_SIGNAL_BRIDGE_ENV "FLUX_SIGNAL_BRIDGE_SIGNALS"
-#define FLUX_DEFAULT_SIGNAL_BRIDGE "SIGUSR1"
+#define FLUX_DEFAULT_SIGNAL_BRIDGE FLUX_SIGNAL_CTRL_DOORBELL_STR
 #define FLUX_EXEC_RING_ENV "FLUX_EXEC_RING_SHM"
 
 /*
@@ -29,6 +30,15 @@ struct flux_run_cfg {
 	char *dump;
 	char *mem_size;
 	char *dma_size;
+	char *nr_cpus;
+	char *cpu_set;
+	char *cpu_shares;
+	char *cpu_quota;
+	char *cpu_period;
+	char *pid_limit;
+	char *blkio_weight;
+	char *network_class_id;
+	char *network_priority;
 
 	/* SPDK configuration. */
 	char **spdk_bdf;
@@ -57,7 +67,7 @@ struct flux_run_cfg {
 };
 
 /*
- * Process-wide runtime state resolved before guest startup and then treated as
+ * Process-wide runtime state resolved before Flux startup and then treated as
  * read-mostly by the runtime.
  */
 struct flux_env {
@@ -67,7 +77,7 @@ struct flux_env {
 	unsigned long mem_size;
 	unsigned long dma_size;
 
-	/* Guest CPU placement on the host. */
+	/* Flux CPU placement on the host. */
 	int nr_cpus;
 	int max_cpus;
 	int *cpu_list;
@@ -81,7 +91,6 @@ struct flux_env {
 	/* Storage and dataplane feature toggles derived from the run cfg. */
 	int spdk_zero_copy;
 	int fnet_enabled;
-	int multiproc_enabled;
 	int malloc_hook_enabled;
 };
 
@@ -106,29 +115,33 @@ int flux_run_cfg_apply_post(struct flux_run_cfg *cfg);
 int flux_run_cfg_load_current(void);
 void flux_run_cfg_free_current(void);
 
-/* Guest startup and program loading. */
+/* Flux startup and program loading. */
 int flux_env_set_cpus(const int *cpu_list, int nr_cpus);
 int flux_env_init(int argc, char **argv);
 int flux_stack_init(int (*entry)(int, char **), int argc, char **argv);
 int flux_init_cpus(void);
 int flux_bind_single_cpu(int cpu);
-int flux_elf_main(const char *filename, int argc, char **argv, char **envp,
-		  flux_post_exec_fn_t fn);
-int flux_load_elf(const char *filename, char **argv, char **envp,
-		  flux_post_exec_fn_t fn);
+char **flux_build_envp(void);
+void flux_free_envp(char **envp);
 int flux_fnet_register_dev(void);
 void flux_thread_longjmp(int cpu);
 
 /* Signal handling used by the host runtime. */
 int flux_signal_init(void);
 int flux_signal_init_percpu(void);
+void *flux_signal_stack_base(void);
+size_t flux_signal_stack_slot_size(void);
+int flux_signal_enable_percpu(void);
 int flux_signal_block_current(void);
 int flux_signal_exit_percpu(void);
 int flux_signal_restore_defaults(void);
 
 /* Kernel-module and allocator hooks. */
 int flux_kmod_init(void);
-int flux_kmod_init_percpu(void *handler);
+int flux_kmod_init_percpu(void *handler, void *synthetic_handler,
+			  int logical_cpu,
+			  unsigned long host_fsbase, void *signal_stack,
+			  size_t signal_stack_slot_size);
 int flux_kmod_exit_percpu(void);
 int flux_kmod_disable_mmap_hooks(void);
 int flux_malloc_hooks_init(void);

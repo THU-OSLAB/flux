@@ -58,7 +58,7 @@ int trans_table_add(struct trans_entry *e)
 		return -EINVAL;
 
 	pr_debug("add proto %u laddr %pI4:%u raddr %pI4:%u\n", e->proto,
-		&e->laddr.ip, e->laddr.port, &e->raddr.ip, e->raddr.port);
+		 &e->laddr.ip, e->laddr.port, &e->raddr.ip, e->raddr.port);
 
 	if (e->match == TRANS_MATCH_3TUPLE)
 		idx = trans_hash_3tuple(e->proto, e->laddr);
@@ -207,27 +207,35 @@ static struct trans_entry *trans_lookup(struct mbuf *m, bool reverse)
  * net_rx_trans - receive an L4 packet
  * m: the mbuf to receive
  */
-void net_rx_trans(struct mbuf *m)
+bool net_rx_trans_match(struct mbuf *m)
 {
-	const struct iphdr *iphdr;
 	struct trans_entry *e;
 
-	/* set up the network header pointers */
 	mbuf_mark_transport_offset(m);
 
 	rcu_read_lock();
 	e = trans_lookup(m, false);
 	if (unlikely(!e)) {
 		rcu_read_unlock();
-		iphdr = mbuf_network_hdr(m, *iphdr);
-		if (iphdr->protocol == IPPROTO_TCP)
-			tcp_rx_closed(m);
-		mbuf_free(m);
-		return;
+		return false;
 	}
 
 	e->ops->recv(e, m);
 	rcu_read_unlock();
+	return true;
+}
+
+void net_rx_trans(struct mbuf *m)
+{
+	const struct iphdr *iphdr;
+
+	if (net_rx_trans_match(m))
+		return;
+
+	iphdr = mbuf_network_hdr(m, *iphdr);
+	if (iphdr->protocol == IPPROTO_TCP)
+		tcp_rx_closed(m);
+	mbuf_free(m);
 }
 
 /**

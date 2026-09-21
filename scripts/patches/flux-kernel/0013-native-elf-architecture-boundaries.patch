@@ -1,0 +1,105 @@
+From: Flux architecture integration
+Subject: [PATCH] exec: retain architecture loader policy in native Linux exec
+
+Linux owns ELF parsing, file mapping, argument pages and tables. Keep optional
+interpreter/environment policy and stack projection at architecture boundaries.
+
+--- a/kernel/fs/exec.c
++++ b/kernel/fs/exec.c
+@@ -507,6 +507,11 @@
+ 	 * See do_execveat_common().
+ 	 */
+ 	ptr_size = (max(bprm->argc, 1) + bprm->envc) * sizeof(void *);
++#ifdef ARCH_EXEC_ENV
++	if (bprm->envc == MAX_ARG_STRINGS)
++		return -E2BIG;
++	ptr_size += sizeof(void *);
++#endif
+ 	if (limit <= ptr_size)
+ 		return -E2BIG;
+ 	limit -= ptr_size;
+@@ -1940,9 +1945,19 @@
+ 		goto out_free;
+ 	bprm->exec = bprm->p;
+ 
++#ifdef ARCH_EXEC_ENV
++	/* Placed last in envp, before copying caller strings backwards. */
++	retval = copy_string_kernel(ARCH_EXEC_ENV, bprm);
++	if (retval < 0)
++		goto out_free;
++#endif
++
+ 	retval = copy_strings(bprm->envc, envp, bprm);
+ 	if (retval < 0)
+ 		goto out_free;
++#ifdef ARCH_EXEC_ENV
++	bprm->envc++;
++#endif
+ 
+ 	retval = copy_strings(bprm->argc, argv, bprm);
+ 	if (retval < 0)
+@@ -2013,9 +2028,19 @@
+ 		goto out_free;
+ 	bprm->exec = bprm->p;
+ 
++#ifdef ARCH_EXEC_ENV
++	/* Placed last in envp, before copying caller strings backwards. */
++	retval = copy_string_kernel(ARCH_EXEC_ENV, bprm);
++	if (retval < 0)
++		goto out_free;
++#endif
++
+ 	retval = copy_strings_kernel(bprm->envc, envp, bprm);
+ 	if (retval < 0)
+ 		goto out_free;
++#ifdef ARCH_EXEC_ENV
++	bprm->envc++;
++#endif
+ 
+ 	retval = copy_strings_kernel(bprm->argc, argv, bprm);
+ 	if (retval < 0)
+--- a/kernel/fs/binfmt_elf.c
++++ b/kernel/fs/binfmt_elf.c
+@@ -66,6 +66,10 @@
+ #define elf_check_fdpic(ex) false
+ #endif
+ 
++#ifndef arch_elf_interpreter
++#define arch_elf_interpreter(path) (path)
++#endif
++
+ static int load_elf_binary(struct linux_binprm *bprm);
+ 
+ #ifdef CONFIG_USELIB
+@@ -895,7 +899,7 @@
+ 		if (elf_interpreter[elf_ppnt->p_filesz - 1] != '\0')
+ 			goto out_free_interp;
+ 
+-		interpreter = open_exec(elf_interpreter);
++		interpreter = open_exec(arch_elf_interpreter(elf_interpreter));
+ 		kfree(elf_interpreter);
+ 		retval = PTR_ERR(interpreter);
+ 		if (IS_ERR(interpreter))
+--- a/kernel/mm/mmap.c
++++ b/kernel/mm/mmap.c
+@@ -2094,6 +2094,20 @@
+ 		return -ENOMEM;
+ 	}
+ 
++#ifdef arch_prepare_mmap
++	/* Argument pages in an unpublished exec mm have no active host mm yet.
++	 * Its final stack is projected by the architecture after exec_mmap.
++	 */
++	if (vma->vm_mm == current->mm && address < vma->vm_start) {
++		error = arch_prepare_mmap(address, vma->vm_start - address,
++					  vma->vm_flags);
++		if (error) {
++			mas_destroy(&mas);
++			return error;
++		}
++	}
++#endif
++
+ 	/* Lock the VMA before expanding to prevent concurrent page faults */
+ 	vma_start_write(vma);
+ 	/*

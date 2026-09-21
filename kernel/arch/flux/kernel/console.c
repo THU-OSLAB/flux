@@ -46,23 +46,7 @@
 #define FLUX_CONS_TTY_MAX_SESSIONS 256
 #define FLUX_CONS_TTY_NAME "fluxcons"
 
-struct flux_cons_backend {
-	long stdin_fd;
-	long stdout_fd;
-	long stderr_fd;
-};
-
-static const struct flux_cons flux_cons_table[] = {
-	{
-		.id = FLUX_EXEC_SESSION_NONE,
-		.kind = FLUX_CONS_KIND_NONE,
-	},
-};
-static const struct flux_cons_backend flux_cons_backend0 = {
-	.stdin_fd = 0,
-	.stdout_fd = 1,
-	.stderr_fd = 2,
-};
+static const long flux_cons_boot_fds[3] = { 0, 1, 2 };
 static DEFINE_XARRAY(flux_cons_tty_by_id);
 static DEFINE_XARRAY(flux_cons_tty_by_line);
 static DEFINE_IDA(flux_cons_tty_lines);
@@ -100,17 +84,11 @@ struct flux_cons_tty_session {
 	long stdin_fd;
 	long stdout_fd;
 	long stderr_fd;
+	unsigned long next_winsize_check;
 	bool persistent;
 };
 
-static struct flux_cons_tty_session flux_cons_tty0 = {
-	.session_id = FLUX_EXEC_SESSION_NONE,
-	.line = 0,
-	.stdin_fd = 0,
-	.stdout_fd = 1,
-	.stderr_fd = 2,
-	.persistent = true,
-};
+static struct flux_cons_tty_session flux_cons_tty0;
 
 static int flux_cons_install_files(struct file *files[3], u32 session_id);
 #ifdef CONFIG_FLUX_RUNC
@@ -304,6 +282,43 @@ static void flux_cons_write_host(long host_fd, const char *buf, size_t len)
 	}
 }
 
+static bool flux_cons_host_fd_needs_crlf(long host_fd)
+{
+	struct termios host_termios = {};
+
+	if (host_syscall(__NR_ioctl, host_fd, TCGETS, &host_termios) < 0)
+		return false;
+
+	return (host_termios.c_oflag & (OPOST | ONLCR)) !=
+	       (OPOST | ONLCR);
+}
+
+static void flux_cons_write_host_crlf(long host_fd, const char *buf,
+				      size_t len, bool *last_was_cr)
+{
+	size_t start = 0;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		bool preceded_by_cr;
+
+		if (buf[i] != '\n')
+			continue;
+
+		preceded_by_cr = i ? buf[i - 1] == '\r' : *last_was_cr;
+		if (preceded_by_cr)
+			continue;
+
+		flux_cons_write_host(host_fd, buf + start, i - start);
+		flux_cons_write_host(host_fd, "\r\n", 2);
+		start = i + 1;
+	}
+
+	flux_cons_write_host(host_fd, buf + start, len - start);
+	if (len)
+		*last_was_cr = buf[len - 1] == '\r';
+}
+
 static struct flux_cons_tty_session *
 flux_cons_tty_session_from_port(struct tty_port *port)
 {
@@ -319,6 +334,28 @@ static void flux_cons_tty_session_stop_input(struct flux_cons_tty_session *sess)
 	sess->input_thread = NULL;
 }
 
+static void flux_cons_tty_sync_host_winsize(struct flux_cons_tty_session *sess)
+{
+	struct tty_struct *tty;
+	struct winsize ws;
+	long ret;
+
+	if (time_before(jiffies, sess->next_winsize_check))
+		return;
+	sess->next_winsize_check =
+		jiffies + msecs_to_jiffies(FLUX_CONSOLE_EOF_SLEEP_MS);
+
+	ret = host_syscall(__NR_ioctl, sess->stdin_fd, TIOCGWINSZ, &ws);
+	if (ret < 0)
+		return;
+
+	tty = tty_port_tty_get(&sess->port);
+	if (!tty)
+		return;
+	tty_do_resize(tty, &ws);
+	tty_kref_put(tty);
+}
+
 static int flux_cons_tty_input_thread_fn(void *arg)
 {
 	struct flux_cons_tty_session *sess = arg;
@@ -330,6 +367,8 @@ static int flux_cons_tty_input_thread_fn(void *arg)
 			.events = POLLIN | POLLHUP | POLLERR,
 		};
 		long ret;
+
+		flux_cons_tty_sync_host_winsize(sess);
 
 		ret = host_syscall(__NR_poll, &pfd, 1, 0);
 		if (ret <= 0) {
@@ -368,8 +407,15 @@ static int flux_cons_tty_port_activate(struct tty_port *port,
 {
 	struct flux_cons_tty_session *sess =
 		flux_cons_tty_session_from_port(port);
+	struct termios host_termios = {};
 	struct winsize ws;
 	long ret;
+
+	ret = host_syscall(__NR_ioctl, sess->stdin_fd, TCGETS,
+			   &host_termios);
+	if (ret >= 0 && !(host_termios.c_lflag & ICANON) &&
+	    !(host_termios.c_oflag & OPOST))
+		tty->termios.c_lflag |= ECHO;
 
 	ret = host_syscall(__NR_ioctl, sess->stdin_fd, TIOCGWINSZ, &ws);
 	if (ret >= 0)
@@ -412,8 +458,16 @@ static bool flux_cons_tty_host_fd_is_tty(long host_fd)
 	return host_syscall(__NR_ioctl, host_fd, TIOCGWINSZ, &ws) >= 0;
 }
 
-static void flux_cons_tty_session_init_port(struct flux_cons_tty_session *sess)
+static void flux_cons_tty_session_init(struct flux_cons_tty_session *sess,
+				       u32 session_id, unsigned int line,
+				       const long fds[3], bool persistent)
 {
+	sess->session_id = session_id;
+	sess->line = line;
+	sess->stdin_fd = fds[0];
+	sess->stdout_fd = fds[1];
+	sess->stderr_fd = fds[2];
+	sess->persistent = persistent;
 	tty_port_init(&sess->port);
 	sess->port.ops = &flux_cons_tty_port_ops;
 }
@@ -475,7 +529,7 @@ static int flux_cons_tty_session_store_locked(struct flux_cons_tty_session *sess
 
 #ifdef CONFIG_FLUX_RUNC
 static int
-flux_cons_tty_session_create_dynamic(const struct flux_cons *cons,
+flux_cons_tty_session_create_dynamic(u32 session_id,
 				     struct flux_cons_tty_session **out)
 {
 	struct flux_cons_tty_session *sess;
@@ -488,7 +542,7 @@ flux_cons_tty_session_create_dynamic(const struct flux_cons *cons,
 	if (line < 0)
 		return line;
 
-	ret = flux_cons_tty_host_fds_open(cons->id, fds);
+	ret = flux_cons_tty_host_fds_open(session_id, fds);
 	if (ret < 0)
 		goto err_line;
 
@@ -498,12 +552,8 @@ flux_cons_tty_session_create_dynamic(const struct flux_cons *cons,
 		goto err_fds;
 	}
 
-	sess->session_id = cons->id;
-	sess->line = (unsigned int)line;
-	sess->stdin_fd = fds[0];
-	sess->stdout_fd = fds[1];
-	sess->stderr_fd = fds[2];
-	flux_cons_tty_session_init_port(sess);
+	flux_cons_tty_session_init(sess, session_id, (unsigned int)line, fds,
+				   false);
 
 	mutex_lock(&flux_cons_tty_lock);
 	ret = flux_cons_tty_session_store_locked(sess, true);
@@ -531,7 +581,9 @@ static int flux_cons_tty_session_prepare_boot(void)
 
 	mutex_lock(&flux_cons_tty_lock);
 	if (!xa_load(&flux_cons_tty_by_line, flux_cons_tty0.line)) {
-		flux_cons_tty_session_init_port(&flux_cons_tty0);
+		flux_cons_tty_session_init(&flux_cons_tty0,
+					   FLUX_EXEC_SESSION_NONE, 0,
+					   flux_cons_boot_fds, true);
 		ret = flux_cons_tty_session_store_locked(&flux_cons_tty0, false);
 	}
 	mutex_unlock(&flux_cons_tty_lock);
@@ -832,7 +884,17 @@ static const struct file_operations flux_cons_file_fops = {
 
 #ifdef CONFIG_FLUX_RUNC
 
-static struct flux_cons flux_cons_dynamic;
+struct flux_cons_stdio_spec {
+	const char *path_name;
+	const char *file_name;
+	int flags;
+};
+
+static const struct flux_cons_stdio_spec flux_cons_stdio_specs[3] = {
+	{ "stdin", "flux-stdin", O_RDONLY | O_CLOEXEC },
+	{ "stdout", "flux-stdout", O_WRONLY | O_CLOEXEC },
+	{ "stderr", "flux-stderr", O_WRONLY | O_CLOEXEC },
+};
 
 static bool flux_cons_is_dynamic_stdio(u32 session_id)
 {
@@ -979,6 +1041,16 @@ static struct file *flux_cons_file_create(u32 session_id, const char *path_name,
 
 #endif /* CONFIG_FLUX_RUNC */
 
+static void flux_cons_put_files(struct file *files[3])
+{
+	int fd;
+
+	for (fd = 0; fd < 3; fd++) {
+		if (files[fd])
+			fput(files[fd]);
+	}
+}
+
 static int flux_cons_install_files(struct file *files[3], u32 session_id)
 {
 	int ret = 0;
@@ -993,62 +1065,39 @@ static int flux_cons_install_files(struct file *files[3], u32 session_id)
 		}
 	}
 
-	for (fd = 0; fd < 3; fd++) {
-		if (files[fd])
-			fput(files[fd]);
-	}
+	flux_cons_put_files(files);
 
 	return ret;
 }
 
 #ifdef CONFIG_FLUX_RUNC
-static int flux_cons_install_host_stdio(const struct flux_cons *cons)
+static int flux_cons_install_host_stdio(u32 session_id)
 {
 	struct file *stdio[3] = { NULL, NULL, NULL };
-	int ret = 0;
+	int ret;
 	int fd;
 
-	stdio[0] = flux_cons_file_create(cons->id, "stdin", "flux-stdin",
-					 O_RDONLY | O_CLOEXEC);
-	if (IS_ERR(stdio[0])) {
-		ret = PTR_ERR(stdio[0]);
-		stdio[0] = NULL;
-		pr_err("failed to open stdio session %u stdin: %d\n", cons->id,
-		       ret);
-		goto out;
-	}
-
-	stdio[1] = flux_cons_file_create(cons->id, "stdout", "flux-stdout",
-					 O_WRONLY | O_CLOEXEC);
-	if (IS_ERR(stdio[1])) {
-		ret = PTR_ERR(stdio[1]);
-		stdio[1] = NULL;
-		pr_err("failed to open stdio session %u stdout: %d\n", cons->id,
-		       ret);
-		goto out;
-	}
-
-	stdio[2] = flux_cons_file_create(cons->id, "stderr", "flux-stderr",
-					 O_WRONLY | O_CLOEXEC);
-	if (IS_ERR(stdio[2])) {
-		ret = PTR_ERR(stdio[2]);
-		stdio[2] = NULL;
-		pr_err("failed to open stdio session %u stderr: %d\n", cons->id,
-		       ret);
-		goto out;
-	}
-
-	ret = flux_cons_install_files(stdio, cons->id);
-	return ret;
-out:
 	for (fd = 0; fd < 3; fd++) {
-		if (stdio[fd])
-			fput(stdio[fd]);
+		const struct flux_cons_stdio_spec *spec =
+			&flux_cons_stdio_specs[fd];
+
+		stdio[fd] = flux_cons_file_create(session_id, spec->path_name,
+						  spec->file_name, spec->flags);
+		if (!IS_ERR(stdio[fd]))
+			continue;
+
+		ret = PTR_ERR(stdio[fd]);
+		stdio[fd] = NULL;
+		pr_err("failed to open stdio session %u %s: %d\n",
+		       session_id, spec->path_name, ret);
+		flux_cons_put_files(stdio);
+		return ret;
 	}
-	return ret;
+
+	return flux_cons_install_files(stdio, session_id);
 }
 
-static int flux_cons_install_host_tty(const struct flux_cons *cons)
+static int flux_cons_install_host_tty(u32 session_id)
 {
 	struct flux_cons_tty_session *sess;
 	int ret;
@@ -1057,16 +1106,16 @@ static int flux_cons_install_host_tty(const struct flux_cons *cons)
 		return -ENODEV;
 
 	mutex_lock(&flux_cons_tty_lock);
-	sess = xa_load(&flux_cons_tty_by_id, cons->id);
+	sess = xa_load(&flux_cons_tty_by_id, session_id);
 	mutex_unlock(&flux_cons_tty_lock);
 
 	if (!sess) {
-		ret = flux_cons_tty_session_create_dynamic(cons, &sess);
+		ret = flux_cons_tty_session_create_dynamic(session_id, &sess);
 		if (ret < 0)
 			return ret;
 	}
 
-	return flux_cons_install_tty_files(sess, cons->id);
+	return flux_cons_install_tty_files(sess, session_id);
 }
 
 #endif /* CONFIG_FLUX_RUNC */
@@ -1083,13 +1132,9 @@ int flux_cons_install_boot_stdio(void)
 		O_WRONLY | O_CLOEXEC,
 		O_WRONLY | O_CLOEXEC,
 	};
-	long host_fds[3] = {
-		flux_cons_backend0.stdin_fd,
-		flux_cons_backend0.stdout_fd,
-		flux_cons_backend0.stderr_fd,
-	};
 	struct file *stdio[3] = { NULL, NULL, NULL };
 	int ret;
+	int fd;
 
 	if (flux_cons_tty_driver && flux_cons_tty_host_fd_is_tty(0)) {
 		ret = flux_cons_tty_session_prepare_boot();
@@ -1102,82 +1147,33 @@ int flux_cons_install_boot_stdio(void)
 			return 0;
 	}
 
-	stdio[0] = flux_cons_file_wrap(host_fds[0], file_names[0], oflags[0],
-				       false, true);
-	stdio[1] = flux_cons_file_wrap(host_fds[1], file_names[1], oflags[1],
-				       false, false);
-	stdio[2] = flux_cons_file_wrap(host_fds[2], file_names[2], oflags[2],
-				       false, false);
-	if (IS_ERR(stdio[0]) || IS_ERR(stdio[1]) || IS_ERR(stdio[2])) {
-		ret = IS_ERR(stdio[0]) ? PTR_ERR(stdio[0]) :
-		      IS_ERR(stdio[1]) ? PTR_ERR(stdio[1]) :
-					 PTR_ERR(stdio[2]);
-		if (!IS_ERR_OR_NULL(stdio[0]))
-			fput(stdio[0]);
-		if (!IS_ERR_OR_NULL(stdio[1]))
-			fput(stdio[1]);
-		if (!IS_ERR_OR_NULL(stdio[2]))
-			fput(stdio[2]);
+	for (fd = 0; fd < 3; fd++) {
+		stdio[fd] = flux_cons_file_wrap(flux_cons_boot_fds[fd],
+						 file_names[fd], oflags[fd], false,
+						 fd == 0);
+		if (!IS_ERR(stdio[fd]))
+			continue;
+
+		ret = PTR_ERR(stdio[fd]);
+		stdio[fd] = NULL;
+		flux_cons_put_files(stdio);
 		return ret;
 	}
 
 	return flux_cons_install_files(stdio, FLUX_EXEC_SESSION_NONE);
 }
 
-const struct flux_cons *flux_cons_lookup(u32 session_id)
+int flux_cons_install_session(u32 session_id)
 {
-	size_t i;
-
-	for (i = 0; i < ARRAY_SIZE(flux_cons_table); i++) {
-		if (flux_cons_table[i].id == session_id)
-			return &flux_cons_table[i];
-	}
-
-#ifdef CONFIG_FLUX_RUNC
-	if (flux_cons_is_dynamic_stdio(session_id)) {
-		flux_cons_dynamic.id = session_id;
-		flux_cons_dynamic.kind = FLUX_CONS_KIND_STDIO;
-		return &flux_cons_dynamic;
-	}
-
-	if (flux_cons_is_dynamic_tty(session_id)) {
-		flux_cons_dynamic.id = session_id;
-		flux_cons_dynamic.kind = FLUX_CONS_KIND_TTY;
-		return &flux_cons_dynamic;
-	}
-#endif
-
-	return NULL;
-}
-
-int flux_cons_install_stdio(const struct flux_cons *cons)
-{
-	if (!cons)
-		return -EINVAL;
-
-	switch (cons->id) {
-	case FLUX_EXEC_SESSION_NONE:
+	if (session_id == FLUX_EXEC_SESSION_NONE)
 		return 0;
-#ifdef CONFIG_FLUX_RUNC
-	default:
-		if (cons->kind == FLUX_CONS_KIND_STDIO)
-			return flux_cons_install_host_stdio(cons);
-		return -EINVAL;
-#endif
-	}
-
-	return -EINVAL;
-}
-
-int flux_cons_install_tty(const struct flux_cons *cons)
-{
-	if (!cons)
-		return -EINVAL;
 
 #ifdef CONFIG_FLUX_RUNC
-	if (cons->kind == FLUX_CONS_KIND_TTY &&
-	    flux_cons_is_dynamic_tty(cons->id))
-		return flux_cons_install_host_tty(cons);
+	if (flux_cons_is_dynamic_stdio(session_id))
+		return flux_cons_install_host_stdio(session_id);
+
+	if (flux_cons_is_dynamic_tty(session_id))
+		return flux_cons_install_host_tty(session_id);
 #endif
 
 	return -EINVAL;
@@ -1188,7 +1184,18 @@ int flux_cons_install_tty(const struct flux_cons *cons)
  */
 static void flux_cons0_write(struct console *con, const char *str, unsigned len)
 {
-	flux_cons_write_host(flux_cons_backend0.stdout_fd, str, len);
+	static int needs_crlf = -1;
+	static bool last_was_cr;
+
+	if (needs_crlf < 0)
+		needs_crlf = flux_cons_host_fd_needs_crlf(
+			flux_cons_boot_fds[1]);
+
+	if (needs_crlf)
+		flux_cons_write_host_crlf(flux_cons_boot_fds[1], str, len,
+					  &last_was_cr);
+	else
+		flux_cons_write_host(flux_cons_boot_fds[1], str, len);
 }
 
 static struct console flux_cons0 = {

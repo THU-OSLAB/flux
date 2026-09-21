@@ -44,7 +44,7 @@ static inline long flux_sys_recv(int fd, void *buf, size_t len, int flags)
 #endif
 
 /*
- * Halt the guest kernel and return control to the host runtime.
+ * Halt the Flux kernel and return control to the host runtime.
  */
 static inline long flux_sys_halt(void)
 {

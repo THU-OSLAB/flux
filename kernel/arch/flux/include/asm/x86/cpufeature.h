@@ -132,7 +132,7 @@ extern const char * const x86_bug_flags[NBUGINTS*32];
  * infrastructure to be used.  It may *not* directly test the CPU
  * itself.  Use the cpu_has() family if you want true runtime
  * testing of CPU features, like in hypervisor code where you are
- * supporting a possible guest feature where host support for it
+ * supporting a possible Flux feature where host support for it
  * is not relevant.
  */
 #define cpu_feature_enabled(bit)	\

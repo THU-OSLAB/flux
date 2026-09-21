@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/ioctl.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <flux.h>
@@ -69,9 +70,44 @@ int flux_runc_console_open_detached_pty(int *master_fd, int *slave_fd)
 		close(master);
 		return ret;
 	}
+	{
+		struct termios attr;
+
+		if (tcgetattr(slave, &attr) < 0) {
+			int ret = -errno;
+
+			close(slave);
+			close(master);
+			return ret;
+		}
+		cfmakeraw(&attr);
+		if (tcsetattr(slave, TCSANOW, &attr) < 0) {
+			int ret = -errno;
+
+			close(slave);
+			close(master);
+			return ret;
+		}
+	}
 
 	*master_fd = master;
 	*slave_fd = slave;
+	return 0;
+}
+
+int flux_runc_console_set_size(int fd, unsigned int width,
+			       unsigned int height)
+{
+	struct winsize size = {
+		.ws_col = (unsigned short)width,
+		.ws_row = (unsigned short)height,
+	};
+
+	if (fd < 0 || width > USHRT_MAX || height > USHRT_MAX)
+		return -EINVAL;
+	if (ioctl(fd, TIOCSWINSZ, &size) < 0)
+		return -errno;
+
 	return 0;
 }
 

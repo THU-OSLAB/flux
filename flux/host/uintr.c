@@ -77,6 +77,10 @@ int flux_uintr_init(void)
 	}
 
 	for (cpu = 0; cpu < nr_cpus; cpu++) {
+		err = flux_uintr_register_vec(cpu, FLUX_UINTR_VECTOR_TIMER);
+		if (err < 0)
+			goto out_free_uipi;
+
 		err = flux_uintr_register_vec(cpu, FLUX_UINTR_VECTOR_SIGNAL);
 		if (err < 0)
 			goto out_free_uipi;
@@ -102,10 +106,5 @@ int flux_uintr_fini(void)
 	free(flux_uipi);
 	flux_uipi = NULL;
 
-	return 0;
-}
-
-int flux_uintr_init_percpu(int cpu)
-{
 	return 0;
 }

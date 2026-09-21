@@ -1,6 +1,5 @@
 POSIX_HOSTS := elf64 elf32
 
-UINTR_ORIGIN := $(origin UINTR)
 SMP_ORIGIN := $(origin SMP)
 FNET_ORIGIN := $(origin FNET)
 FAST_NET_ORIGIN := $(origin FAST_NET)
@@ -67,8 +66,8 @@ define flux_configure_llvm
 endef
 
 define flux_apply_build_config
-    $(if $(LLVM),$(call flux_configure_llvm),$(call flux_configure_gnu))
-    $(if $(filter $(flux_input_origins),$(UINTR_ORIGIN)),$(if $(call flux_flag_enabled,$(UINTR)),$(call flux_set_config_var,UINTR,y),$(call flux_set_config_var,UINTR,n)))
+	$(if $(LLVM),$(call flux_configure_llvm),$(call flux_configure_gnu))
+	$(call flux_set_config_var,UINTR,y)
     $(if $(filter $(flux_input_origins),$(MAX_CPUS_ORIGIN)),\
         $(call flux_set_config_var,MAX_CPUS,$(MAX_CPUS)),\
         $(if $(strip $(CONFIG_FLUX_MAX_CPUS)),,$(call flux_set_config_var,MAX_CPUS,1)))
@@ -82,7 +81,7 @@ define flux_apply_build_config
                 $(call flux_set_config_var,SMP,n)),\
             $(call flux_set_config_var,SMP,n)))
     $(if $(filter $(flux_input_origins),$(FNET_ORIGIN)),$(if $(call flux_flag_enabled,$(FNET)),$(call flux_set_config_var,FNET,y),$(call flux_set_config_var,FNET,n)))
-    $(if $(filter $(flux_input_origins),$(FAST_NET_ORIGIN)),$(if $(call flux_flag_enabled,$(FAST_NET)),$(call flux_set_config_var,FNET,y),$(call flux_set_config_var,FNET,n)))
+    $(if $(filter $(flux_input_origins),$(FAST_NET_ORIGIN)),$(if $(call flux_flag_enabled,$(FAST_NET)),$(call flux_set_config_var,FNET,y)))
     $(if $(filter $(flux_input_origins),$(FAST_NET_ORIGIN)),$(if $(call flux_flag_enabled,$(FAST_NET)),$(call flux_set_config_var,FAST_NET,y),$(call flux_set_config_var,FAST_NET,n)))
     $(if $(filter $(flux_input_origins),$(SPDK_ORIGIN)),$(if $(call flux_flag_enabled,$(SPDK)),$(call flux_set_config_var,SPDK,y),$(call flux_set_config_var,SPDK,n)))
     $(if $(filter $(flux_input_origins),$(RUNC_ORIGIN)),\

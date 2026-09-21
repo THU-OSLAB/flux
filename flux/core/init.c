@@ -6,7 +6,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
-#include <setjmp.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,19 +13,22 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/rseq.h>
+#include <sys/syscall.h>
+#include <sys/auxv.h>
+#include <time.h>
+#include <ucontext.h>
 
 #include <kernel/asm/flux_oci.h>
 #include <flux.h>
 #include <flux/mpk.h>
+#include <flux/rewrite.h>
 #include <flux/runc.h>
 
-#include "elf.h"
-#include "vdso.h"
+#define FLUX_RUNTIME_STACK_SIZE (8 * 1024 * 1024)
 #include "oci.h"
 #include "io/iok_client.h"
-#ifdef CONFIG_FLUX_UINTR
 #include "host/uintr.h"
-#endif
 #ifdef CONFIG_FLUX_SPDK
 #include "io/spdk.h"
 #endif
@@ -36,18 +38,28 @@ struct flux_env flux_env = {
 	.dma_size = 256 * MB,
 	.spdk_zero_copy = 0,
 	.fnet_enabled = false,
-	.multiproc_enabled = false,
 	.malloc_hook_enabled = false,
 };
 
-static jmp_buf flux_exit_jmpbuf[CONFIG_FLUX_MAX_CPUS];
+static ucontext_t flux_exit_context[CONFIG_FLUX_MAX_CPUS];
+static atomic_bool flux_exit_resume[CONFIG_FLUX_MAX_CPUS];
 
+/*
+ * Return from the Flux kernel stack to the saved host pthread frame without
+ * invoking glibc's longjmp cleanup unwinder.  Flux can be interrupted
+ * while libc has a cleanup record on its stack; unwinding that record with
+ * the restored host TLS may run an unrelated cleanup handler and deadlock.
+ */
 void flux_thread_longjmp(int cpu)
 {
 	if (cpu < 0 || cpu >= CONFIG_FLUX_MAX_CPUS)
 		abort();
 
-	longjmp(flux_exit_jmpbuf[cpu], 1);
+	atomic_store_explicit(&flux_exit_resume[cpu], true,
+			      memory_order_release);
+	if (setcontext(&flux_exit_context[cpu]) < 0)
+		abort();
+	abort();
 }
 
 struct flux_pcpu_args {
@@ -65,6 +77,17 @@ struct flux_main_args {
 	const char *filename;
 };
 static struct flux_main_args main_start_args;
+
+#define FLUX_EXIT_SYNC_TIMEOUT_NS (5ULL * 1000 * 1000 * 1000)
+#define FLUX_PERCPU_EXIT_TIMEOUT_NS (20ULL * 1000 * 1000 * 1000)
+
+static uint64_t flux_monotonic_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 * 1000 * 1000 + ts.tv_nsec;
+}
 
 static int flux_exec_ring_map_current(void)
 {
@@ -301,7 +324,12 @@ int flux_init_rootfs(void)
 {
 	static const struct flux_mount_spec rootfs_mounts[] = {
 		{ "devtmpfs", "/dev", "devtmpfs", NULL, 0755 },
-		{ "tmpfs", "/dev/shm", "tmpfs", "rw,nodev", 0777 },
+		/*
+		 * nodev is an MS_NODEV mount flag, not a tmpfs data parameter.
+		 * The raw Flux mount syscall rejects it in the data string.
+		 */
+		{ "tmpfs", "/dev/shm", "tmpfs", "mode=1777", 0777,
+		  FLUX_MS_NODEV },
 		{ "tmpfs", "/mnt", "tmpfs", "mode=0777", 0700 },
 		{ "tmpfs", "/tmp", "tmpfs", "mode=0777", 0777 },
 		{ "sysfs", "/sys", "sysfs", NULL, 0700 },
@@ -326,6 +354,16 @@ int flux_init_rootfs(void)
 		FLUX_LOG(FLUX_LOG_DEBUG, "mount(%s@%s): %s\n",
 			 rootfs_mounts[i].source, rootfs_mounts[i].target,
 			 flux_strerror(err));
+		/*
+		 * CONFIG_DEVTMPFS_MOUNT may have mounted /dev before Flux
+		 * initializes the remaining root filesystem.  Reusing that
+		 * exact mount is equivalent to completing this entry; keep
+		 * EBUSY fatal for every other rootfs mount.
+		 */
+		if (err == -FLUX_EBUSY &&
+		    !strcmp(rootfs_mounts[i].type, "devtmpfs") &&
+		    !strcmp(rootfs_mounts[i].target, "/dev"))
+			continue;
 		if (err < 0)
 			return err;
 	}
@@ -341,39 +379,6 @@ int flux_init_rootfs(void)
 	return 0;
 }
 
-static void jump_to_entry(void *entry, unsigned long stack)
-{
-	FLUX_LOG(FLUX_LOG_INFO, "jump to entry %p stack %lx\n", entry, stack);
-
-#if defined(__x86_64__)
-#ifdef CONFIG_FLUX_MPK
-	__asm__ __volatile__("mov %[stack], %%rsp\n\t"
-			     "xor %%rbp, %%rbp\n\t"
-			     "movl %[app_pkru], %%eax\n\t"
-			     "xor %%ecx, %%ecx\n\t"
-			     "xor %%edx, %%edx\n\t"
-			     ".byte 0x0f, 0x01, 0xef\n\t"
-			     "cmpl %[app_pkru], %%eax\n\t"
-			     "jne 1f\n\t"
-			     "jmp *%[entry]\n\t"
-			     "1: ud2\n\t"
-			     :
-			     : [stack] "r"(stack), [entry] "r"(entry),
-			       [app_pkru] "i"(FLUX_MPK_APP_PKRU)
-			     : "memory", "eax", "ecx", "edx");
-#else
-	__asm__ __volatile__("mov %0, %%rsp\n\t"
-			     "xor %%rbp, %%rbp\n\t"
-			     "jmp *%1\n\t"
-			     :
-			     : "r"(stack), "r"(entry)
-			     : "memory");
-#endif
-#else
-#error "only x86_64 supported"
-#endif
-}
-
 /*
  * Mirror the effective kernel bootmem layout so the host can reclaim the whole
  * kernel memory window after shutdown.
@@ -382,6 +387,8 @@ static inline size_t flux_kernel_dma_size(void)
 {
 	size_t size = flux_env.dma_size;
 
+	if (!size)
+		return 0;
 	if (size < 256 * MB)
 		size = 256 * MB;
 
@@ -444,10 +451,26 @@ static void flux_percpu_exit_sync(int cpu)
 
 	atomic_fetch_add(&exit_sync_arrived, 1);
 	if (cpu == 0) {
-		while (atomic_load(&exit_sync_arrived) != nr)
+		uint64_t deadline =
+			flux_monotonic_ns() + FLUX_EXIT_SYNC_TIMEOUT_NS;
+
+		while (atomic_load(&exit_sync_arrived) != nr &&
+		       flux_monotonic_ns() < deadline)
 			sched_yield();
+		if (atomic_load(&exit_sync_arrived) != nr)
+			FLUX_LOG(FLUX_LOG_WARN,
+				 "exit sync timed out on cpu 0: arrived=%d/%d\n",
+				 atomic_load(&exit_sync_arrived), nr);
 		atomic_store(&exit_sync_done, 1);
 	} else {
+		/*
+		 * A follower may leave Flux well before CPU0 begins shutdown.
+		 * Its own arrival time therefore cannot define the barrier deadline:
+		 * doing so lets it tear down host state before the coordinator has
+		 * observed the other CPUs.  CPU0 has the bounded wait above and always
+		 * publishes the decision; the isolated runtime remains protected by the
+		 * runner's process deadline if CPU0 itself never returns.
+		 */
 		while (!atomic_load(&exit_sync_done))
 			sched_yield();
 	}
@@ -455,6 +478,8 @@ static void flux_percpu_exit_sync(int cpu)
 
 static void flux_main_entry(void *unused)
 {
+	int err;
+
 	FLUX_LOG(FLUX_LOG_INFO, "kernel main entry\n");
 
 	/* init kernel VFS */
@@ -472,7 +497,6 @@ static void flux_main_entry(void *unused)
 	/* setup kernel sysctl parameters */
 	flux_sysctl("vm.dirty_ratio", "100");
 	flux_sysctl("vm.dirty_background_ratio", "100");
-	flux_sysctl("vm.overcommit_memory", "1");
 	flux_sysctl("vm.swappiness", "0");
 
 	flux_run_cfg_apply_post(run_cfg);
@@ -481,6 +505,7 @@ static void flux_main_entry(void *unused)
 	/* register fnet net device */
 	if (flux_fnet_register_dev() < 0) {
 		FLUX_LOG(FLUX_LOG_ERR, "failed to register fnet device\n");
+		goto out;
 	}
 #endif
 
@@ -494,19 +519,12 @@ static void flux_main_entry(void *unused)
 	}
 #endif
 
-	if (flux_env.multiproc_enabled) {
-		/*
-		 * The shared malloc arena must exist before END_MAP_SHARED so
-		 * the kmod base-map snapshot retains it across later mm cleanups.
-		 */
-		if (flux_malloc_hooks_init() < 0) {
-			FLUX_LOG(FLUX_LOG_ERR,
-				 "failed to init shared malloc arena\n");
-			goto out;
-		}
-		flux_malloc_hooks_enable();
-		flux_kmod_disable_mmap_hooks();
+	/* The runtime arena belongs in every fork and fresh exec projection. */
+	if (flux_malloc_hooks_init() < 0) {
+		FLUX_LOG(FLUX_LOG_ERR, "failed to init shared malloc arena\n");
+		goto out;
 	}
+	flux_malloc_hooks_enable();
 
 	if (flux_apply_oci_process_state() < 0) {
 		FLUX_LOG(FLUX_LOG_ERR,
@@ -514,8 +532,27 @@ static void flux_main_entry(void *unused)
 		goto out;
 	}
 
-	flux_elf_main(main_start_args.filename, main_start_args.argc,
-		      main_start_args.argv, NULL, jump_to_entry);
+	if (flux_kmod_disable_mmap_hooks() < 0)
+		goto out;
+#ifdef CONFIG_FLUX_MPK
+	if (flux_mpk_uaccess_init() < 0) {
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "failed to initialize MPK uaccess policy\n");
+		goto out;
+	}
+#endif
+
+	char **exec_envp = NULL;
+
+	exec_envp = flux_build_envp();
+	if (!exec_envp)
+		goto out;
+	err = flux_kernel_exec(main_start_args.filename, main_start_args.argv,
+			       exec_envp);
+	flux_free_envp(exec_envp);
+	if (err < 0)
+		FLUX_LOG(FLUX_LOG_ERR, "failed to execute application: %s (%d)\n",
+			 flux_strerror(err), err);
 
 	flux_sys_sync();
 out:
@@ -523,7 +560,12 @@ out:
 }
 
 static atomic_int bind_done = 0;
-static int bind_failed = 0;
+static atomic_int bind_failed = 0;
+
+static __always_inline void flux_uintr_enable_once(void)
+{
+	asm volatile("stui" : : : "memory");
+}
 
 static int flux_init_boot_cmdline(void)
 {
@@ -535,6 +577,33 @@ static int flux_init_boot_cmdline(void)
 		 "%s mem=%s dma_size=%s", run_cfg->boot_cmdline ?: "",
 		 run_cfg->mem_size ?: "4G", run_cfg->dma_size ?: "256M");
 
+	return 0;
+}
+
+static int flux_disable_host_rseq(void)
+{
+#ifdef RSEQ_SIG
+	struct rseq *rseq;
+
+	/*
+	 * Synthetic host-mm switches drop the worker's scheduler MM-CID.
+	 * Unregister host glibc's rseq before the first switch, with or without
+	 * MPK; a later host return must not publish an invalid MM-CID into TLS.
+	 * MPK also prevents host rseq writes to protected runtime TLS. Flux
+	 * application rseq remains independently registered and managed by Flux.
+	 */
+	if (!__rseq_size)
+		return 0;
+
+	rseq = (void *)((char *)__builtin_thread_pointer() + __rseq_offset);
+	if (syscall(SYS_rseq, rseq, __rseq_size, RSEQ_FLAG_UNREGISTER,
+		    RSEQ_SIG) < 0) {
+		FLUX_LOG(FLUX_LOG_ERR, "failed to unregister host rseq: %s\n",
+			 strerror(errno));
+		return -1;
+	}
+	rseq->cpu_id = RSEQ_CPU_ID_REGISTRATION_FAILED;
+#endif
 	return 0;
 }
 
@@ -557,32 +626,17 @@ static void flux_percpu_entry(void *arg)
 		goto cleanup;
 	}
 
+	if (flux_disable_host_rseq() < 0) {
+		failed = true;
+		goto cleanup;
+	}
 #ifdef CONFIG_FLUX_MPK
-	if (flux_mpk_disable_host_rseq() < 0) {
-		failed = true;
-		goto cleanup;
-	}
 	flux_mpk_enter_kernel();
-#endif
-
-#ifdef CONFIG_FLUX_UINTR
-	if (flux_kmod_init_percpu(flux_uintr_handler) < 0) {
-		FLUX_LOG(FLUX_LOG_ERR, "failed to init kmod percpu\n");
-		failed = true;
-		goto cleanup;
-	}
-
-	/* init percpu uintr entries */
-	if (flux_uintr_init_percpu(cpu)) {
-		FLUX_LOG(FLUX_LOG_ERR, "failed to init uintr percpu\n");
-		failed = true;
-		goto cleanup;
-	}
 #endif
 
 	if (flux_signal_init_percpu() < 0) {
 		FLUX_LOG(FLUX_LOG_ERR,
-			 "failed to enable signals on percpu thread\n");
+			 "failed to prepare signals on percpu thread\n");
 		failed = true;
 		goto cleanup;
 	}
@@ -590,31 +644,64 @@ static void flux_percpu_entry(void *arg)
 	flux_save_host_fsbase(cpu);
 	fsbase_saved = true;
 
+	if (flux_kmod_init_percpu(flux_uintr_handler,
+				  flux_uintr_signal_stack, cpu,
+				  flux_host_fsbases[cpu],
+				  flux_signal_stack_base(),
+				  flux_signal_stack_slot_size()) < 0) {
+		FLUX_LOG(FLUX_LOG_ERR, "failed to init kmod percpu\n");
+		failed = true;
+		goto cleanup;
+	}
+
+	if (flux_signal_enable_percpu() < 0) {
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "failed to enable signals on percpu thread\n");
+		failed = true;
+		goto cleanup;
+	}
+
 	atomic_fetch_add(&bind_done, 1);
 	while (atomic_load(&bind_done) != flux_env.nr_cpus) {
-		if (bind_failed) {
+		if (atomic_load(&bind_failed)) {
 			failed = true;
 			goto cleanup;
 		}
 		sched_yield();
 	}
 
-	args->ready = 1;
+	__atomic_store_n(&args->ready, 1, __ATOMIC_RELEASE);
 
-	if (setjmp(flux_exit_jmpbuf[cpu]) == 0) {
+	if (getcontext(&flux_exit_context[cpu]) < 0) {
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "failed to save cpu %d host context: %s\n", cpu,
+			 strerror(errno));
+		failed = true;
+		goto cleanup;
+	}
+	if (!atomic_exchange_explicit(&flux_exit_resume[cpu], false,
+				      memory_order_acquire)) {
+		/*
+		 * kmod installed this CPU's initial UINTR xstate with UIF clear.
+		 * Enable delivery exactly once, after all host-side setup and saved
+		 * exit context work, immediately before the non-returning kernel entry.
+		 */
+		flux_uintr_enable_once();
+
 		/* kernel entry */
 		if (!cpu) {
 			flux_host.ops = &flux_host_ops;
+			flux_host.elf_interpreter = run_cfg->ld_path;
+			flux_host.hwcap = getauxval(AT_HWCAP);
+			flux_host.hwcap2 = getauxval(AT_HWCAP2);
 #ifdef CONFIG_FLUX_SPDK
 			flux_host.spdk = &flux_spdk;
 #endif
-#ifdef CONFIG_FLUX_UINTR
 			flux_host.uipi = flux_uipi;
-#endif
 			flux_host.max_cpus = flux_env.max_cpus;
+			flux_host.nr_cpus = flux_env.nr_cpus;
 			flux_host.main = flux_main_entry;
 			flux_host.fsbases = flux_host_fsbases;
-			flux_host.vvar = flux_vdso_data();
 			flux_start_kernel(&flux_host, flux_env.boot_cmdline);
 		} else {
 #ifdef CONFIG_FLUX_SMP
@@ -637,23 +724,77 @@ cleanup:
 		FLUX_LOG(FLUX_LOG_ERR,
 			 "failed to teardown percpu signal state on exit\n");
 
-#ifdef CONFIG_FLUX_UINTR
 	if (flux_kmod_exit_percpu() < 0)
 		FLUX_LOG(FLUX_LOG_ERR,
 			 "failed to teardown kmod percpu state on exit\n");
-#endif
 
 	if (failed) {
 		args->failed = 1;
-		bind_failed = 1;
+		atomic_store(&bind_failed, 1);
 	}
 
-	flux_host_ops.thread_exit();
+	__atomic_store_n(&args->ready, 2, __ATOMIC_RELEASE);
+	/*
+	 * Both pthread_exit() and a normal pthread start-routine return eventually
+	 * enter glibc's common thread-exit machinery. Under fork-heavy workloads
+	 * that path can stall even though every Flux teardown stage above has
+	 * completed. These dedicated percpu threads have no TLS
+	 * destructors or pthread cleanup handlers to run, so terminate only this
+	 * thread through the kernel.  CLONE_CHILD_CLEARTID still wakes
+	 * pthread_join(), allowing the parent to reclaim the pthread descriptor.
+	 */
+	syscall(__flux__NR_exit, 0);
+	__builtin_unreachable();
+}
+
+static void flux_wait_percpu_exit(struct flux_pcpu_args *args)
+{
+	/*
+	 * This wait spans the complete Flux lifetime, not just teardown.  Keep it
+	 * unbounded here so normal tests lasting more than a few seconds are not
+	 * mistaken for cleanup failures.  The per-test runner owns the real
+	 * runtime deadline and can terminate this isolated process safely.
+	 */
+	while (__atomic_load_n(&args->ready, __ATOMIC_ACQUIRE) != 2)
+		sched_yield();
+}
+
+static bool flux_wait_percpu_exit_until(struct flux_pcpu_args *args,
+					uint64_t deadline)
+{
+	while (__atomic_load_n(&args->ready, __ATOMIC_ACQUIRE) != 2) {
+		if (flux_monotonic_ns() >= deadline)
+			return false;
+		sched_yield();
+	}
+
+	return true;
+}
+
+static __attribute__((noreturn)) void
+flux_abort_percpu_cleanup(int cpu)
+{
+	FLUX_LOG(FLUX_LOG_ERR,
+		 "timed out waiting for cpu %d host thread to exit; terminating runtime\n",
+		 cpu);
+	/*
+	 * A live per-CPU thread can still hold Flux locks or reference the Flux
+	 * mappings.  Do not run normal process teardown or free shared state from
+	 * underneath it.  This is the isolated Flux child, so terminating the
+	 * complete process is the only safe cleanup path.
+	 */
+	_Exit(EXIT_FAILURE);
 }
 
 static int flux_bind_cpus(void)
 {
 	int i;
+	int ret = 0;
+	bool init_lifetime_done = false;
+	uint64_t cleanup_deadline = 0;
+
+	atomic_store(&bind_done, 0);
+	atomic_store(&bind_failed, 0);
 
 	pcpu_start_args =
 		calloc(flux_env.nr_cpus, sizeof(struct flux_pcpu_args));
@@ -670,16 +811,36 @@ static int flux_bind_cpus(void)
 			flux_percpu_entry, (void *)&pcpu_start_args[i],
 			"percpu_entry");
 		if (!pcpu_start_args[i].th) {
-			bind_failed = 1;
+			atomic_store(&bind_failed, 1);
+			ret = -1;
 			goto out;
 		}
 	}
 
 out:
 	for (i = 0; i < flux_env.nr_cpus; i++) {
-		if (pcpu_start_args[i].th) {
-			flux_host_ops.thread_join(pcpu_start_args[i].th);
+		if (!pcpu_start_args[i].th)
+			continue;
+
+		if (!init_lifetime_done) {
+			/*
+			 * CPU0 owns the Flux init lifetime.  Wait for it without a local
+			 * deadline so a legitimate long-running test is not mistaken for
+			 * teardown.  Only after it exits are remaining CPUs in cleanup.
+			 */
+			flux_wait_percpu_exit(&pcpu_start_args[i]);
+			init_lifetime_done = true;
+			cleanup_deadline = flux_monotonic_ns() +
+					   FLUX_PERCPU_EXIT_TIMEOUT_NS;
+		} else if (!flux_wait_percpu_exit_until(&pcpu_start_args[i],
+							 cleanup_deadline)) {
+			flux_abort_percpu_cleanup(pcpu_start_args[i].cpu);
 		}
+
+		if (flux_host_ops.thread_join(pcpu_start_args[i].th) < 0)
+			flux_abort_percpu_cleanup(pcpu_start_args[i].cpu);
+		if (pcpu_start_args[i].failed)
+			ret = -1;
 	}
 	free(pcpu_start_args);
 
@@ -690,13 +851,9 @@ out:
 	if (flux_env.malloc_hook_enabled)
 		flux_malloc_hooks_disable();
 
-	if (flux_reclaim_kernel_pages() < 0)
-		FLUX_LOG(FLUX_LOG_ERR,
-			 "failed to reclaim/quarantine kernel pages\n");
-
 	FLUX_LOG(FLUX_LOG_INFO, "all cpus exits\n");
 
-	return 0;
+	return ret;
 }
 
 /*
@@ -708,14 +865,14 @@ int flux_stack_init(int (*entry)(int, char **), int argc, char **argv)
 	void *stack_top;
 	int ret = 0;
 
-	stack = mmap(NULL, FLUX_USER_STACK_SIZE, PROT_READ | PROT_WRITE,
+	stack = mmap(NULL, FLUX_RUNTIME_STACK_SIZE, PROT_READ | PROT_WRITE,
 		     MAP_SHARED | MAP_ANONYMOUS | MAP_STACK, -1, 0);
 	if (stack == MAP_FAILED) {
 		FLUX_LOG(FLUX_LOG_ERR, "mmap stack failed\n");
 		return -FLUX_ENOMEM;
 	}
 
-	stack_top = (void *)((uintptr_t)stack + FLUX_USER_STACK_SIZE);
+	stack_top = (void *)((uintptr_t)stack + FLUX_RUNTIME_STACK_SIZE);
 	stack_top = (void *)((uintptr_t)stack_top & ~0xFULL);
 
 	FLUX_LOG(FLUX_LOG_INFO, "switch to bigger stack %p\n", stack_top);
@@ -735,7 +892,7 @@ int flux_stack_init(int (*entry)(int, char **), int argc, char **argv)
 #error "only x86_64 supported"
 #endif
 
-	munmap(stack, FLUX_USER_STACK_SIZE);
+	munmap(stack, FLUX_RUNTIME_STACK_SIZE);
 	return ret;
 }
 
@@ -756,6 +913,17 @@ static int flux_rodata_init(void)
 	rodata = (struct flux_rodata *)addr;
 	rodata->syscall_fast = flux_syscall_fast;
 	rodata->syscall = flux_syscall;
+	rodata->syscall_rewrite = flux_syscall_dispatch;
+	rodata->syscall_sigreturn_nostack = flux_syscall_sigreturn_nostack;
+
+	addr = mmap((void *)FLUX_MPK_RETURN_ADDR, FLUX_MPK_RETURN_AREA_SIZE,
+		    PROT_READ | PROT_WRITE,
+		    MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (addr == MAP_FAILED) {
+		FLUX_LOG(FLUX_LOG_ERR, "mmap return slots failed\n");
+		return -1;
+	}
+	memset(addr, 0, FLUX_MPK_RETURN_AREA_SIZE);
 
 	return 0;
 }
@@ -772,10 +940,8 @@ static int flux_env_free(void)
 int flux_env_init(int argc, char **argv)
 {
 	int ret;
-	bool vdso_inited = false;
-#ifdef CONFIG_FLUX_UINTR
+	bool iok_client_inited = false;
 	bool uintr_inited = false;
-#endif
 
 	FLUX_LOG(FLUX_LOG_INFO, "starting libos\n");
 
@@ -786,15 +952,9 @@ int flux_env_init(int argc, char **argv)
 	if (flux_launch_get() && flux_launch_get()->filename)
 		main_start_args.filename = flux_launch_get()->filename;
 
-	if (getenv("FLUX_MULTIPROC"))
-		flux_env.multiproc_enabled = true;
 
 	if ((ret = flux_rodata_init()) < 0)
 		goto out;
-
-	if ((ret = flux_vdso_init()) < 0)
-		goto out;
-	vdso_inited = true;
 
 	if ((ret = flux_run_cfg_load_current()) < 0)
 		goto out;
@@ -819,6 +979,7 @@ int flux_env_init(int argc, char **argv)
 			 ret);
 		goto out_free_env;
 	}
+	iok_client_inited = true;
 
 	if ((ret = flux_init_cpus()) < 0) {
 		FLUX_LOG(FLUX_LOG_ERR, "failed to init cpus\n");
@@ -833,13 +994,11 @@ int flux_env_init(int argc, char **argv)
 	if ((ret = flux_exec_ring_map_current()) < 0)
 		goto out_free_env;
 
-#ifdef CONFIG_FLUX_UINTR
 	if ((ret = flux_uintr_init()) < 0) {
 		FLUX_LOG(FLUX_LOG_ERR, "failed to init uintr\n");
 		goto out_free_env;
 	}
 	uintr_inited = true;
-#endif
 
 #ifdef CONFIG_FLUX_SPDK
 	if ((ret = flux_spdk_init()) < 0) {
@@ -852,34 +1011,37 @@ int flux_env_init(int argc, char **argv)
 		FLUX_LOG(FLUX_LOG_ERR, "failed to initialize MPK isolation\n");
 		goto out_free_env;
 	}
-#ifdef CONFIG_FLUX_MPK
-	if ((ret = flux_vdso_protect_shared()) < 0)
+	if ((ret = flux_rewrite_init()) < 0) {
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "failed to initialize executable rewriting\n");
 		goto out_free_env;
-#endif
+	}
 
-	flux_bind_cpus();
+	if ((ret = flux_bind_cpus()) < 0)
+		FLUX_LOG(FLUX_LOG_ERR, "failed to bind one or more CPUs\n");
 
-#ifdef CONFIG_FLUX_UINTR
+	flux_iok_client_fini();
+	iok_client_inited = false;
+	if (flux_reclaim_kernel_pages() < 0)
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "failed to reclaim/quarantine kernel pages\n");
+
 	if (uintr_inited)
 		flux_uintr_fini();
-#endif
 
 #ifdef CONFIG_FLUX_SPDK
 	flux_spdk_fini();
 #endif
-	flux_vdso_fini();
 
-	return 0;
+	return ret;
 out_free_env:
-#ifdef CONFIG_FLUX_UINTR
+	if (iok_client_inited)
+		flux_iok_client_fini();
 	if (uintr_inited)
 		flux_uintr_fini();
-#endif
 	flux_env_free();
 out_free_cfg:
 	flux_run_cfg_free_current();
 out:
-	if (vdso_inited)
-		flux_vdso_fini();
 	return ret;
 }

@@ -1,6 +1,6 @@
 #define pr_fmt(fmt) "flux_mpk: " fmt
 
-#include <asm/cpuid.h>
+#include <asm/processor.h>
 #include <asm/fpu/signal.h>
 #include <asm/fpu/types.h>
 #include <asm/sigframe.h>
@@ -23,9 +23,10 @@
 #include "hook.h"
 #include "mm.h"
 #include "mpk.h"
+#include "uintr.h"
 
-static long (*orig_x64_sys_call)(const struct pt_regs *regs,
-				  unsigned int nr);
+static long (*orig_x64_sys_call)(const struct pt_regs *regs, unsigned int nr);
+static long (*orig_x64_sys_rt_sigreturn)(const struct pt_regs *regs);
 static int (*orig_x64_setup_rt_frame)(struct ksignal *ksig,
 				      struct pt_regs *regs);
 static bool (*orig_copy_fpstate_to_sigframe)(void __user *buf,
@@ -38,10 +39,13 @@ static atomic_t flux_mpk_active_calls = ATOMIC_INIT(0);
 static DECLARE_WAIT_QUEUE_HEAD(flux_mpk_active_waitq);
 static unsigned int flux_mpk_users;
 static bool flux_mpk_hooks_installed;
+static bool flux_uintr_signal_hooks_installed;
 static bool flux_mpk_disable_pending;
 static bool flux_mpk_module_ref;
 
 static struct flux_hook_group mpk_hook_group;
+static struct flux_hook_group uintr_signal_hook_group;
+static int flux_mpk_state_init(void);
 static int flux_mpk_disable_thread(void *unused);
 
 static void flux_mpk_schedule_disable_locked(void)
@@ -52,16 +56,14 @@ static void flux_mpk_schedule_disable_locked(void)
 		return;
 
 	flux_mpk_disable_pending = true;
-	task = kthread_run(flux_mpk_disable_thread, NULL,
-			   "flux_mpk_cleanup");
+	task = kthread_run(flux_mpk_disable_thread, NULL, "flux_mpk_cleanup");
 	if (IS_ERR(task)) {
 		flux_mpk_disable_pending = false;
 		pr_err("failed to start cleanup thread: %ld\n", PTR_ERR(task));
 	}
 }
 
-static bool flux_mpk_patch_signal_pkru(void __user *buf_fx, int size,
-				       u32 pkru);
+static bool flux_mpk_patch_signal_pkru(void __user *buf_fx, int size, u32 pkru);
 
 static void flux_mpk_call_done(void)
 {
@@ -69,45 +71,72 @@ static void flux_mpk_call_done(void)
 		wake_up_all(&flux_mpk_active_waitq);
 }
 
-enum flux_mpk_signal_phase {
-	FLUX_MPK_SIGNAL_IDLE,
-	FLUX_MPK_SIGNAL_BUILDING,
-	FLUX_MPK_SIGNAL_FRAME_READY,
-	FLUX_MPK_SIGNAL_ACTIVE,
-};
-
-struct flux_mpk_signal_state {
-	struct task_struct *task;
-	enum flux_mpk_signal_phase phase;
-	u32 expected_pkru;
-	unsigned long stack_start;
-	unsigned long stack_size;
-	unsigned long frame;
-	void __user *fpstate;
-	unsigned int fpstate_size;
-};
-
-static DEFINE_PER_CPU(struct flux_mpk_signal_state, flux_mpk_signal_state);
-
-static struct flux_mpk_signal_state *flux_mpk_signal_state_this_cpu(void)
+static struct uintr_percpu *flux_mpk_uintr_this_cpu(void)
 {
-	return raw_cpu_ptr(&flux_mpk_signal_state);
+	return &raw_cpu_ptr(&flux_percpu)->uintr;
 }
 
-static void flux_mpk_signal_state_reset(struct flux_mpk_signal_state *state)
+static struct uintr_signal_record *
+flux_mpk_signal_state_find_phase(enum uintr_signal_phase phase)
 {
-	memset(state, 0, sizeof(*state));
+	struct uintr_percpu *p = flux_mpk_uintr_this_cpu();
+	unsigned int i;
+
+	for (i = 0; i < FLUX_SIGNAL_STACK_SLOTS; i++) {
+		struct uintr_signal_record *state = &p->sig_records[i];
+
+		if (state->phase == phase && state->task == current)
+			return state;
+	}
+	return NULL;
+}
+
+static struct uintr_signal_record *
+flux_mpk_signal_state_find_sigreturn(const struct pt_regs *regs)
+{
+	struct uintr_percpu *p = flux_mpk_uintr_this_cpu();
+	unsigned int i;
+
+	for (i = 0; i < FLUX_SIGNAL_STACK_SLOTS; i++) {
+		struct uintr_signal_record *state = &p->sig_records[i];
+
+		if (state->phase == UINTR_SIGNAL_ACTIVE &&
+		    state->task == current &&
+		    regs->sp == state->frame + sizeof(unsigned long))
+			return state;
+	}
+	return NULL;
+}
+
+static struct uintr_signal_record *flux_mpk_signal_state_begin(int *err)
+{
+	struct uintr_percpu *p = flux_mpk_uintr_this_cpu();
+	unsigned int slot = p->sig_building_slot;
+	struct uintr_signal_record *state;
+
+	if (slot == UINTR_SIGNAL_SLOT_OVERFLOW) {
+		*err = -EOVERFLOW;
+		return NULL;
+	}
+	if (WARN_ON_ONCE(slot >= FLUX_SIGNAL_STACK_SLOTS)) {
+		*err = -EFAULT;
+		return NULL;
+	}
+	state = &p->sig_records[slot];
+	if (WARN_ON_ONCE(state->phase != UINTR_SIGNAL_CAPTURED)) {
+		*err = -EFAULT;
+		return NULL;
+	}
+	return state;
 }
 
 static bool flux_mpk_worker_current(void)
 {
-	struct flux_percpu *pcpu = raw_cpu_ptr(&flux_percpu);
-
-	return READ_ONCE(pcpu->uintr.assigned_task) == current;
+	return READ_ONCE(flux_mpk_uintr_this_cpu()->assigned_task) == current;
 }
 
-static bool flux_mpk_range_has_pkey(unsigned long start, unsigned long len,
-				    int pkey, vm_flags_t required_flags)
+bool flux_mpk_range_has_pkey(unsigned long start, unsigned long len,
+				    int pkey, unsigned long required_flags)
 {
 	struct vm_area_struct *vma;
 	unsigned long cursor = start;
@@ -147,14 +176,7 @@ static bool flux_mpk_range_within(unsigned long start, unsigned long len,
 
 static bool flux_mpk_enabled_current(void)
 {
-	struct flux_mm_ctx *ctx = flux_mm_ctx_get_current();
-	bool enabled = false;
-
-	if (ctx)
-		enabled = READ_ONCE(ctx->mpk_enabled);
-	flux_mm_ctx_put(ctx);
-
-	return enabled;
+	return flux_mm_mpk_enabled_current_rcu();
 }
 
 static bool flux_mpk_restricted_current(void)
@@ -164,24 +186,19 @@ static bool flux_mpk_restricted_current(void)
 }
 
 static bool flux_mpk_prepare_sigreturn(const struct pt_regs *regs,
-				       struct flux_mpk_signal_state *state)
+				       struct uintr_signal_record *state)
 {
 	struct xregs_state __user *xsave = state->fpstate;
 	u64 xfeatures, xcomp_bv;
 
-	if (state->phase != FLUX_MPK_SIGNAL_ACTIVE || state->task != current ||
+	if (state->phase != UINTR_SIGNAL_ACTIVE || state->task != current ||
 	    read_pkru() != FLUX_MPK_KERNEL_PKRU ||
 	    regs->sp != state->frame + sizeof(unsigned long) ||
 	    !flux_mpk_range_within(state->frame, sizeof(struct rt_sigframe),
 				   state->stack_start, state->stack_size) ||
 	    !flux_mpk_range_within((unsigned long)state->fpstate,
 				   state->fpstate_size, state->stack_start,
-				   state->stack_size) ||
-	    !flux_mpk_range_has_pkey(state->frame, sizeof(struct rt_sigframe),
-				     FLUX_MPK_KERNEL_PKEY, VM_WRITE) ||
-	    !flux_mpk_range_has_pkey((unsigned long)state->fpstate,
-				     state->fpstate_size,
-				     FLUX_MPK_KERNEL_PKEY, VM_WRITE))
+				   state->stack_size))
 		return false;
 
 	if (__get_user(xfeatures, &xsave->header.xfeatures) ||
@@ -190,29 +207,13 @@ static bool flux_mpk_prepare_sigreturn(const struct pt_regs *regs,
 	    (xcomp_bv & XCOMP_BV_COMPACTED_FORMAT))
 		return false;
 
-	return flux_mpk_patch_signal_pkru(state->fpstate,
-					  state->fpstate_size,
+	return flux_mpk_patch_signal_pkru(state->fpstate, state->fpstate_size,
 					  state->expected_pkru);
 }
 
 static long hook_x64_sys_call(const struct pt_regs *regs, unsigned int nr)
 {
-	struct flux_mpk_signal_state *state =
-		flux_mpk_signal_state_this_cpu();
 	long ret;
-
-	if (nr == __NR_rt_sigreturn && state->task == current &&
-	    state->phase == FLUX_MPK_SIGNAL_ACTIVE) {
-		if (!flux_mpk_prepare_sigreturn(regs, state)) {
-			flux_mpk_signal_state_reset(state);
-			ret = -EPERM;
-			goto out;
-		}
-
-		ret = orig_x64_sys_call(regs, nr);
-		flux_mpk_signal_state_reset(state);
-		goto out;
-	}
 
 	if (unlikely(flux_mpk_restricted_current())) {
 		ret = -EPERM;
@@ -225,8 +226,32 @@ out:
 	return ret;
 }
 
-static bool flux_mpk_patch_signal_pkru(void __user *buf_fx, int size,
-				       u32 pkru)
+static long hook_x64_sys_rt_sigreturn(const struct pt_regs *regs)
+{
+	struct uintr_signal_record *state;
+	long ret;
+
+	state = flux_mpk_signal_state_find_sigreturn(regs);
+	if (state) {
+		if (!flux_mpk_prepare_sigreturn(regs, state)) {
+			ret = -EPERM;
+			goto out;
+		}
+	} else if (flux_mpk_signal_state_find_phase(UINTR_SIGNAL_ACTIVE)) {
+		/* Never consume another suspended frame on an unmatched return. */
+		ret = -EPERM;
+		goto out;
+	}
+
+	uintr_begin_rt_sigreturn(regs->sp - sizeof(unsigned long));
+	ret = orig_x64_sys_rt_sigreturn(regs);
+	uintr_complete_rt_sigreturn(regs->ip);
+out:
+	flux_mpk_call_done();
+	return ret;
+}
+
+static bool flux_mpk_patch_signal_pkru(void __user *buf_fx, int size, u32 pkru)
 {
 	struct xregs_state __user *xsave = buf_fx;
 	struct pkru_state pkru_state = {
@@ -236,7 +261,7 @@ static bool flux_mpk_patch_signal_pkru(void __user *buf_fx, int size,
 
 	if (size < 0 || flux_mpk_pkru_xstate_offset > (unsigned int)size ||
 	    sizeof(pkru_state) >
-		(unsigned int)size - flux_mpk_pkru_xstate_offset)
+		    (unsigned int)size - flux_mpk_pkru_xstate_offset)
 		return false;
 
 	if (__get_user(xfeatures, &xsave->header.xfeatures))
@@ -244,24 +269,22 @@ static bool flux_mpk_patch_signal_pkru(void __user *buf_fx, int size,
 	xfeatures |= XFEATURE_MASK_PKRU;
 	if (__put_user(xfeatures, &xsave->header.xfeatures))
 		return false;
-	if (copy_to_user((char __user *)buf_fx +
-			 flux_mpk_pkru_xstate_offset,
+	if (copy_to_user((char __user *)buf_fx + flux_mpk_pkru_xstate_offset,
 			 &pkru_state, sizeof(pkru_state)))
 		return false;
 
 	return true;
 }
 
-static bool hook_copy_fpstate_to_sigframe(void __user *buf,
-					  void __user *buf_fx, int size,
-					  u32 pkru)
+static bool hook_copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx,
+					  int size, u32 pkru)
 {
-	struct flux_mpk_signal_state *state =
-		flux_mpk_signal_state_this_cpu();
+	struct uintr_signal_record *state =
+		flux_mpk_signal_state_find_phase(UINTR_SIGNAL_MPK_BUILDING);
 	bool ret;
 
-	if (state->task != current ||
-	    state->phase != FLUX_MPK_SIGNAL_BUILDING ||
+	if (!state || state->task != current ||
+	    state->phase != UINTR_SIGNAL_MPK_BUILDING ||
 	    pkru != state->expected_pkru) {
 		ret = orig_copy_fpstate_to_sigframe(buf, buf_fx, size, pkru);
 		goto out;
@@ -289,39 +312,84 @@ out:
 	return ret;
 }
 
-static int hook_x64_setup_rt_frame(struct ksignal *ksig,
-				   struct pt_regs *regs)
+static int hook_x64_setup_rt_frame(struct ksignal *ksig, struct pt_regs *regs)
 {
-	struct flux_mpk_signal_state *state =
-		flux_mpk_signal_state_this_cpu();
+	struct uintr_percpu *p = flux_mpk_uintr_this_cpu();
+	struct uintr_signal_record *state;
+	struct rt_sigframe __user *frame;
+	stack_t saved_stack;
+	u64 signal_cookie;
+	bool captured_uif = false;
+	unsigned long host_fsbase = 0;
+	bool flux_frame;
+	unsigned long stack_start;
+	unsigned long stack_size;
+	unsigned int slot;
 	u32 pkru = read_pkru();
 	unsigned long handler = (unsigned long)ksig->ka.sa.sa_handler;
+	int logical_cpu = -1;
 	int ret;
 
-	if (!flux_mpk_worker_current() ||
-	    (pkru != FLUX_MPK_APP_PKRU && pkru != FLUX_MPK_KERNEL_PKRU)) {
+	/*
+	 * This hook is global.  A non-Flux task may build a signal frame after a
+	 * Flux worker captured UIF on the same CPU; it must not consume that
+	 * worker's pending frame transaction.
+	 */
+	if (!flux_mpk_worker_current()) {
+		ret = orig_x64_setup_rt_frame(ksig, regs);
+		goto out_done;
+	}
+
+	if (pkru != FLUX_MPK_APP_PKRU && pkru != FLUX_MPK_KERNEL_PKRU) {
 		ret = orig_x64_setup_rt_frame(ksig, regs);
 		goto out;
 	}
 
-	if (state->phase != FLUX_MPK_SIGNAL_IDLE ||
-	    !(ksig->ka.sa.sa_flags & SA_ONSTACK) || !current->sas_ss_size ||
-	    !flux_mpk_range_has_pkey(current->sas_ss_sp, current->sas_ss_size,
-				     FLUX_MPK_KERNEL_PKEY, VM_WRITE) ||
-	    !flux_mpk_range_has_pkey(handler, 1, FLUX_MPK_KERNEL_PKEY,
-				     VM_EXEC))
-		{
-			ret = -EFAULT;
-			goto out;
-		}
+	if (!(ksig->ka.sa.sa_flags & SA_ONSTACK)) {
+		ret = -EFAULT;
+		goto out;
+	}
+	state = flux_mpk_signal_state_begin(&ret);
+	if (!state)
+		goto out;
+	if (WARN_ON_ONCE(!p->assigned_ctx || !p->assigned_ctx->signal_stack ||
+			 p->assigned_ctx->signal_stack_slot_size == 0)) {
+		ret = -EFAULT;
+		goto out;
+	}
+	slot = state - p->sig_records;
+	stack_size = p->assigned_ctx->signal_stack_slot_size;
+	stack_start = p->assigned_ctx->signal_stack + slot * stack_size;
+	if (handler != p->assigned_ctx->signal_handler) {
+		ret = -EFAULT;
+		goto out;
+	}
 
 	state->task = current;
-	state->phase = FLUX_MPK_SIGNAL_BUILDING;
+	state->phase = UINTR_SIGNAL_MPK_BUILDING;
 	state->expected_pkru = pkru;
-	state->stack_start = current->sas_ss_sp;
-	state->stack_size = current->sas_ss_size;
+	state->stack_start = stack_start;
+	state->stack_size = stack_size;
 
+	saved_stack.ss_sp = (void __user *)current->sas_ss_sp;
+	saved_stack.ss_size = current->sas_ss_size;
+	saved_stack.ss_flags = current->sas_ss_flags;
+	current->sas_ss_sp = stack_start;
+	current->sas_ss_size = stack_size;
+	current->sas_ss_flags = SS_AUTODISARM;
 	ret = orig_x64_setup_rt_frame(ksig, regs);
+	current->sas_ss_sp = (unsigned long)saved_stack.ss_sp;
+	current->sas_ss_size = saved_stack.ss_size;
+	current->sas_ss_flags = saved_stack.ss_flags;
+	if (ret)
+		goto frame_failed;
+
+	frame = (struct rt_sigframe __user *)regs->sp;
+	if (copy_to_user(&frame->uc.uc_stack, &saved_stack,
+			 sizeof(saved_stack))) {
+		ret = -EFAULT;
+		goto frame_failed;
+	}
 	if (ret || read_pkru() != FLUX_MPK_KERNEL_PKRU || !state->fpstate ||
 	    state->fpstate_size == 0 ||
 	    !flux_mpk_range_within(regs->sp, sizeof(struct rt_sigframe),
@@ -329,28 +397,52 @@ static int hook_x64_setup_rt_frame(struct ksignal *ksig,
 	    !flux_mpk_range_within((unsigned long)state->fpstate,
 				   state->fpstate_size, state->stack_start,
 				   state->stack_size)) {
-		write_pkru(pkru);
-		flux_mpk_signal_state_reset(state);
 		ret = ret ?: -EFAULT;
-		goto out;
+		goto frame_failed;
 	}
 
 	state->frame = regs->sp;
-	state->phase = FLUX_MPK_SIGNAL_FRAME_READY;
+	state->phase = UINTR_SIGNAL_FRAME_READY;
 	/* Private fourth argument consumed by flux_host_signal_entry. */
 	regs->cx = pkru;
 	ret = 0;
+	goto out;
+frame_failed:
+	write_pkru(pkru);
 out:
+	flux_frame = uintr_complete_signal_frame(ret ? 0 : regs->sp,
+						  &captured_uif, &logical_cpu,
+						  &host_fsbase);
+	if (!ret && flux_frame) {
+		/*
+		 * Native signal setup leaves caller-saved R8/R9 untouched.  Tag the
+		 * private fifth argument so a non-Flux interrupted register image can
+		 * never be mistaken for delivery metadata.  A missing frame owner or
+		 * overflow remains tagged but invalid and therefore fails closed.
+		 */
+		signal_cookie = FLUX_SIGNAL_ENTRY_COOKIE_TAG;
+		if (logical_cpu >= 0 &&
+		    (unsigned int)logical_cpu <=
+			    (unsigned int)FLUX_SIGNAL_ENTRY_COOKIE_CPU_MASK) {
+			signal_cookie |= FLUX_SIGNAL_ENTRY_COOKIE_VALID |
+					 (u64)logical_cpu;
+			if (captured_uif)
+				signal_cookie |= FLUX_SIGNAL_ENTRY_COOKIE_UIF;
+		}
+		regs->r8 = signal_cookie;
+		regs->r9 = host_fsbase;
+	}
+out_done:
 	flux_mpk_call_done();
 	return ret;
 }
 
 static void hook_fpu_clear_user_states(struct fpu *fpu)
 {
-	struct flux_mpk_signal_state *state =
-		flux_mpk_signal_state_this_cpu();
-	bool signal_frame = state->task == current &&
-			    state->phase == FLUX_MPK_SIGNAL_FRAME_READY;
+	struct uintr_signal_record *state =
+		flux_mpk_signal_state_find_phase(UINTR_SIGNAL_FRAME_READY);
+	bool signal_frame = state && state->task == current &&
+			    state->phase == UINTR_SIGNAL_FRAME_READY;
 
 	orig_fpu_clear_user_states(fpu);
 	if (!signal_frame) {
@@ -358,8 +450,9 @@ static void hook_fpu_clear_user_states(struct fpu *fpu)
 		return;
 	}
 
+	uintr_reclear_signal_uif();
 	write_pkru(FLUX_MPK_KERNEL_PKRU);
-	state->phase = FLUX_MPK_SIGNAL_ACTIVE;
+	state->phase = UINTR_SIGNAL_ACTIVE;
 	flux_mpk_call_done();
 }
 
@@ -372,6 +465,10 @@ int flux_mpk_enable(struct flux_mm_ctx *ctx)
 		goto out;
 
 	if (!flux_mpk_hooks_installed) {
+		ret = flux_mpk_state_init();
+		if (ret)
+			goto out;
+
 		if (!try_module_get(THIS_MODULE)) {
 			ret = -ENODEV;
 			goto out;
@@ -419,7 +516,11 @@ int flux_mpk_validate_app_range(struct flux_mm_ctx *ctx, unsigned long arg)
 {
 	struct flux_mpk_range range;
 	struct vm_area_struct *vma;
+	unsigned long cursor;
 	unsigned long end;
+	bool alias_only = true;
+	bool shadow_only = true;
+	bool saw_shadow = false;
 	int ret = 0;
 
 	if (!READ_ONCE(ctx->mpk_enabled))
@@ -433,39 +534,87 @@ int flux_mpk_validate_app_range(struct flux_mm_ctx *ctx, unsigned long arg)
 	if (!current->mm)
 		return -EINVAL;
 
+	/*
+	 * Alias installation holds this mutex across its temporary PROT_NONE
+	 * reservation and PFNMAP/PTE conversion.  Take it before mmap_lock, in
+	 * the same order as the alias paths, so validation cannot reject that
+	 * safe intermediate VMA as a non-app mapping.
+	 */
+	mutex_lock(flux_alias_mm_lock(current->mm));
+	cursor = range.start;
 	mmap_read_lock(current->mm);
 	vma = find_vma_intersection(current->mm, range.start, end);
 	while (vma && vma->vm_start < end) {
-		if (vma_pkey(vma) != FLUX_MPK_APP_PKEY) {
-			ret = -EPERM;
-			break;
+		unsigned long first = max(range.start, vma->vm_start);
+		unsigned long last = min(end, vma->vm_end);
+
+		if (first != cursor) {
+			alias_only = false;
 		}
+		if (vma_pkey(vma) == FLUX_MPK_APP_PKEY) {
+			alias_only = false;
+			if (vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC))
+				shadow_only = false;
+			else
+				saw_shadow = true;
+		} else {
+			if (!flux_alias_range_has_pkey(vma, first, last,
+						      FLUX_MPK_APP_PKEY)) {
+				ret = -EPERM;
+				break;
+			}
+			saw_shadow = true;
+		}
+		cursor = last;
 		vma = find_vma(current->mm, vma->vm_end);
 	}
+	/*
+	 * Distinguish a completed alias from a safe host shadow.  A shadow may
+	 * cover only part of the requested range; gaps can be filled when the
+	 * caller rebuilds the reservation.  Accessible app VMAs retain the
+	 * validate-only zero result, and non-app mappings remain errors.
+	 */
+	if (!ret && alias_only && cursor == end)
+		ret = FLUX_MPK_APP_RANGE_ALIAS;
+	else if (!ret && shadow_only && saw_shadow)
+		ret = FLUX_MPK_APP_RANGE_SHADOW;
 	mmap_read_unlock(current->mm);
+	mutex_unlock(flux_alias_mm_lock(current->mm));
 
 	return ret;
 }
 
 static struct flux_ftrace_hook mpk_hooks[] = {
-	FLUX_SYSCALL_HOOK("x64_sys_call", hook_x64_sys_call,
-			  &orig_x64_sys_call, &flux_mpk_active_calls),
-	FLUX_TRACKED_HOOK("x64_setup_rt_frame", hook_x64_setup_rt_frame,
-			  &orig_x64_setup_rt_frame, &flux_mpk_active_calls),
-	FLUX_TRACKED_HOOK("copy_fpstate_to_sigframe",
-			  hook_copy_fpstate_to_sigframe,
-			  &orig_copy_fpstate_to_sigframe,
+	FLUX_SYSCALL_HOOK("x64_sys_call", hook_x64_sys_call, &orig_x64_sys_call,
 			  &flux_mpk_active_calls),
-	FLUX_TRACKED_HOOK("fpu__clear_user_states",
-			  hook_fpu_clear_user_states,
-			  &orig_fpu_clear_user_states,
-			  &flux_mpk_active_calls),
+	FLUX_TRACKED_HOOK(
+		"copy_fpstate_to_sigframe", hook_copy_fpstate_to_sigframe,
+		&orig_copy_fpstate_to_sigframe, &flux_mpk_active_calls),
+	FLUX_TRACKED_HOOK("fpu__clear_user_states", hook_fpu_clear_user_states,
+			  &orig_fpu_clear_user_states, &flux_mpk_active_calls),
 };
 
 static struct flux_hook_group mpk_hook_group = {
 	.name = "mpk",
 	.hooks = mpk_hooks,
 	.nr_hooks = ARRAY_SIZE(mpk_hooks),
+};
+
+static struct flux_ftrace_hook uintr_signal_hooks[] = {
+	FLUX_GLOBAL_TRACKED_HOOK("__x64_sys_rt_sigreturn",
+				 hook_x64_sys_rt_sigreturn,
+				 &orig_x64_sys_rt_sigreturn,
+				 &flux_mpk_active_calls),
+	FLUX_GLOBAL_TRACKED_HOOK("x64_setup_rt_frame",
+				 hook_x64_setup_rt_frame,
+				 &orig_x64_setup_rt_frame,
+				 &flux_mpk_active_calls),
+};
+
+static struct flux_hook_group uintr_signal_hook_group = {
+	.name = "uintr_signal",
+	.hooks = uintr_signal_hooks,
+	.nr_hooks = ARRAY_SIZE(uintr_signal_hooks),
 };
 
 static int flux_mpk_disable_thread(void *unused)
@@ -494,16 +643,47 @@ static int flux_mpk_disable_thread(void *unused)
 	return err;
 }
 
-int flux_mpk_hook_init(void)
+static int flux_mpk_state_init(void)
 {
-	unsigned int eax, ebx, ecx, edx;
+	unsigned int eax = 0x0d;
+	unsigned int ebx = 0;
+	unsigned int ecx = XFEATURE_PKRU;
+	unsigned int edx = 0;
 
-	cpuid_count(0x0d, XFEATURE_PKRU, &eax, &ebx, &ecx, &edx);
+	native_cpuid(&eax, &ebx, &ecx, &edx);
 	if (eax < sizeof(struct pkru_state) || !ebx)
 		return -EOPNOTSUPP;
 	flux_mpk_pkru_xstate_offset = ebx;
 
 	return 0;
+}
+
+int flux_uintr_signal_hook_init(void)
+{
+	int ret = 0;
+
+	mutex_lock(&flux_mpk_hook_lock);
+	if (flux_uintr_signal_hooks_installed)
+		goto out;
+	ret = flux_hook_group_install(&uintr_signal_hook_group);
+	if (!ret)
+		flux_uintr_signal_hooks_installed = true;
+out:
+	mutex_unlock(&flux_mpk_hook_lock);
+	return ret;
+}
+
+void flux_uintr_signal_hook_exit(void)
+{
+	mutex_lock(&flux_mpk_hook_lock);
+	if (flux_uintr_signal_hooks_installed &&
+	    !flux_hook_group_remove(&uintr_signal_hook_group)) {
+		wait_event(flux_mpk_active_waitq,
+			   atomic_read(&flux_mpk_active_calls) == 0);
+		synchronize_rcu_tasks();
+		flux_uintr_signal_hooks_installed = false;
+	}
+	mutex_unlock(&flux_mpk_hook_lock);
 }
 
 void flux_mpk_hook_exit(void)

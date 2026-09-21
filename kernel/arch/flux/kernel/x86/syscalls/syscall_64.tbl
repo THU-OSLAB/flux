@@ -15,10 +15,10 @@
 6	common	lstat			sys_newlstat
 7	common	poll			sys_poll
 8	common	lseek			sys_lseek
-9	common	mmap			sys_host_mmap
-10	common	mprotect		sys_host_mprotect
-11	common	munmap			sys_host_munmap
-12	common	brk			    sys_host_brk
+9	common	mmap			sys_flux_mmap
+10	common	mprotect		sys_flux_mprotect
+11	common	munmap			sys_flux_munmap
+12	common	brk			    sys_brk
 13	common	rt_sigaction	sys_rt_sigaction
 14	common	rt_sigprocmask	sys_rt_sigprocmask
 15	common	rt_sigreturn	sys_rt_sigreturn
@@ -31,13 +31,13 @@
 22	common	pipe			sys_pipe
 23	common	select			sys_select
 24	common	sched_yield		sys_sched_yield
-25	common	mremap			sys_host_mremap
-26	common	msync			sys_host_msync
-27	common	mincore			sys_host_mincore
-28	common	madvise			sys_host_madvise
-29	common	shmget			sys_host_shmget
-30	common	shmat			sys_host_shmat
-31	common	shmctl			sys_host_shmctl
+25	common	mremap			sys_flux_mremap
+26	common	msync			sys_msync
+27	common	mincore			sys_mincore
+28	common	madvise			sys_flux_madvise
+29	common	shmget			sys_shmget
+30	common	shmat			sys_shmat
+31	common	shmctl			sys_shmctl
 32	common	dup			sys_dup
 33	common	dup2			sys_dup2
 34	common	pause			sys_pause
@@ -77,9 +77,9 @@
 55	common	getsockopt		sys_getsockopt
 55	fastnet	getsockopt		sys_fast_getsockopt
 56	common	clone			sys_clone
-57	common	fork
-58	common	vfork
-59	common	execve          sys_host_execve
+57	common	fork			sys_fork
+58	common	vfork			sys_vfork
+59	common	execve          sys_execve
 60	common	exit			sys_exit
 61	common	wait4           sys_wait4
 62	common	kill			sys_kill
@@ -87,7 +87,7 @@
 64	common	semget			sys_semget
 65	common	semop			sys_semop
 66	common	semctl			sys_semctl
-67	common	shmdt			sys_host_shmdt
+67	common	shmdt			sys_shmdt
 68	common	msgget			sys_msgget
 69	common	msgsnd			sys_msgsnd
 70	common	msgrcv			sys_msgrcv
@@ -121,7 +121,7 @@
 98	common	getrusage		sys_getrusage
 99	common	sysinfo			sys_sysinfo
 100	common	times			sys_times
-101	common	ptrace
+101	common	ptrace			sys_ptrace
 102	common	getuid			sys_getuid
 103	common	syslog          sys_syslog
 104	common	getgid			sys_getgid
@@ -168,45 +168,45 @@
 146	common	sched_get_priority_max	sys_sched_get_priority_max
 147	common	sched_get_priority_min	sys_sched_get_priority_min
 148	common	sched_rr_get_interval	sys_sched_rr_get_interval
-149	common	mlock			sys_host_mlock
-150	common	munlock			sys_host_munlock
-151	common	mlockall		sys_host_mlockall
-152	common	munlockall		sys_host_munlockall
-153	common	vhangup
-154	common	modify_ldt
-155	common	pivot_root
+149	common	mlock			sys_mlock
+150	common	munlock			sys_munlock
+151	common	mlockall		sys_mlockall
+152	common	munlockall		sys_munlockall
+153	common	vhangup		sys_vhangup
+154	common	modify_ldt	sys_ni_syscall
+155	common	pivot_root	sys_pivot_root
 156	common	_sysctl
 157	common	prctl			sys_prctl
 158	common	arch_prctl		sys_arch_prctl
-159	common	adjtimex
+159	common	adjtimex	sys_adjtimex
 160	common	setrlimit		sys_setrlimit
 161	common	chroot			sys_chroot
 162	common	sync			sys_sync
-163	common	acct
+163	common	acct		sys_acct
 164	common	settimeofday	sys_settimeofday
 165	common	mount			sys_mount
 166	common	umount2			sys_umount
-167	common	swapon          sys_host_swapon
-168	common	swapoff         sys_host_swapoff
+167	common	swapon          sys_swapon
+168	common	swapoff         sys_swapoff
 169	common	reboot			sys_reboot
 170	common	sethostname		sys_sethostname
 171	common	setdomainname	sys_setdomainname
 172	common	iopl			sys_host_iopl
 173	common	ioperm			sys_host_ioperm
-174	common	create_module
-175	common	init_module
-176	common	delete_module
-177	common	get_kernel_syms
-178	common	query_module
-179	common	quotactl
-180	common	nfsservctl
-181	common	getpmsg
-182	common	putpmsg
-183	common	afs_syscall
-184	common	tuxcall
-185	common	security
+174	common	create_module	sys_ni_syscall
+175	common	init_module		sys_init_module
+176	common	delete_module		sys_delete_module
+177	common	get_kernel_syms	sys_ni_syscall
+178	common	query_module	sys_ni_syscall
+179	common	quotactl	sys_quotactl
+180	common	nfsservctl	sys_ni_syscall
+181	common	getpmsg		sys_ni_syscall
+182	common	putpmsg		sys_ni_syscall
+183	common	afs_syscall	sys_ni_syscall
+184	common	tuxcall		sys_ni_syscall
+185	common	security	sys_ni_syscall
 186	common	gettid			sys_gettid
-187	common	readahead
+187	common	readahead		sys_readahead
 188	common	setxattr		sys_setxattr
 189	common	lsetxattr		sys_lsetxattr
 190	common	fsetxattr		sys_fsetxattr
@@ -229,17 +229,17 @@
 208	common	io_getevents	    sys_io_getevents
 209	common	io_submit		    sys_io_submit
 210	common	io_cancel		    sys_io_cancel
-211	common	get_thread_area
+211	common	get_thread_area	sys_ni_syscall
 212	common	lookup_dcookie		sys_lookup_dcookie
 213	common	epoll_create		sys_epoll_create
-214	common	epoll_ctl_old
-215	common	epoll_wait_old
-216	common	remap_file_pages
+214	common	epoll_ctl_old	sys_ni_syscall
+215	common	epoll_wait_old	sys_ni_syscall
+216	common	remap_file_pages	sys_remap_file_pages
 217	common	getdents64		sys_getdents64
 218	common	set_tid_address		sys_set_tid_address
 219	common	restart_syscall     sys_restart_syscall
 220	common	semtimedop		    sys_semtimedop
-221	common	fadvise64		sys_fadvise64
+221	common	fadvise64		sys_fadvise64_64
 222	common	timer_create		sys_timer_create
 223	common	timer_settime		sys_timer_settime
 224	common	timer_gettime		sys_timer_gettime
@@ -254,26 +254,26 @@
 233	common	epoll_ctl		sys_epoll_ctl
 234	common	tgkill			    sys_tgkill
 235	common	utimes			sys_utimes
-237	common	mbind			    sys_host_mbind
-238	common	set_mempolicy		sys_host_set_mempolicy
-239	common	get_mempolicy		sys_host_get_mempolicy
-240	common	mq_open
-241	common	mq_unlink
-242	common	mq_timedsend
-243	common	mq_timedreceive
-244	common	mq_notify
-245	common	mq_getsetattr
-246	common	kexec_load
+237	common	mbind			    sys_mbind
+238	common	set_mempolicy		sys_set_mempolicy
+239	common	get_mempolicy		sys_get_mempolicy
+240	common	mq_open			sys_mq_open
+241	common	mq_unlink		sys_mq_unlink
+242	common	mq_timedsend		sys_mq_timedsend
+243	common	mq_timedreceive		sys_mq_timedreceive
+244	common	mq_notify		sys_mq_notify
+245	common	mq_getsetattr		sys_mq_getsetattr
+246	common	kexec_load	sys_ni_syscall
 247	common	waitid			    sys_waitid
-248	common	add_key
-249	common	request_key
-250	common	keyctl
-251	common	ioprio_set
-252	common	ioprio_get
-253	common	inotify_init
-254	common	inotify_add_watch
-255	common	inotify_rm_watch
-256	common	migrate_pages
+248	common	add_key			sys_add_key
+249	common	request_key		sys_request_key
+250	common	keyctl			sys_keyctl
+251	common	ioprio_set		sys_ioprio_set
+252	common	ioprio_get		sys_ioprio_get
+253	common	inotify_init		sys_inotify_init
+254	common	inotify_add_watch	sys_inotify_add_watch
+255	common	inotify_rm_watch	sys_inotify_rm_watch
+256	common	migrate_pages	sys_migrate_pages
 257	common	openat			sys_openat
 258	common	mkdirat			sys_mkdirat
 259	common	mknodat			sys_mknodat
@@ -289,14 +289,14 @@
 269	common	faccessat		sys_faccessat
 270	common	pselect6		sys_pselect6
 271	common	ppoll			sys_ppoll
-272	common	unshare
+272	common	unshare			sys_unshare
 273	common	set_robust_list		sys_set_robust_list
 274	common	get_robust_list		sys_get_robust_list
-275	common	splice
-276	common	tee
+275	common	splice			sys_splice
+276	common	tee			sys_tee
 277	common	sync_file_range		sys_sync_file_range
-278	common	vmsplice
-279	common	move_pages
+278	common	vmsplice		sys_vmsplice
+279	common	move_pages	sys_move_pages
 280	common	utimensat		sys_utimensat
 281	common	epoll_pwait		sys_epoll_pwait
 282	common	signalfd		sys_signalfd
@@ -307,18 +307,19 @@
 287	common	timerfd_gettime	sys_timerfd_gettime
 288	common	accept4			sys_accept4
 288	fastnet	accept4			sys_fast_accept4
-289	common	signalfd4
+289	common	signalfd4		sys_signalfd4
 290	common	eventfd2		sys_eventfd2
 291	common	epoll_create1	sys_epoll_create1
 292	common	dup3			sys_dup3
 293	common	pipe2			sys_pipe2
+294	common	inotify_init1		sys_inotify_init1
 295	common	preadv			sys_preadv
 296	common	pwritev			sys_pwritev
-297	common	rt_tgsigqueueinfo
-298	common	perf_event_open
+297	common	rt_tgsigqueueinfo	sys_rt_tgsigqueueinfo
+298	common	perf_event_open		sys_flux_perf_event_open
 299	common	recvmmsg		sys_recvmmsg
-300	common	fanotify_init
-301	common	fanotify_mark
+300	common	fanotify_init		sys_fanotify_init
+301	common	fanotify_mark		sys_fanotify_mark
 302	common	prlimit64		sys_prlimit64
 303	common	name_to_handle_at	sys_name_to_handle_at
 304	common	open_by_handle_at	sys_open_by_handle_at
@@ -327,29 +328,30 @@
 307	common	sendmmsg		sys_sendmmsg
 308	common	setns			sys_setns
 309	common	getcpu			sys_getcpu
-310	common	process_vm_readv
-311	common	process_vm_writev
-312	common	kcmp
-313	common	finit_module
+310	common	process_vm_readv	sys_process_vm_readv
+311	common	process_vm_writev	sys_process_vm_writev
+312	common	kcmp			sys_kcmp
+313	common	finit_module		sys_finit_module
 314	common	sched_setattr	sys_sched_setattr
 315	common	sched_getattr	sys_sched_getattr
 316	common	renameat2		sys_renameat2
+317	common	seccomp			sys_seccomp
 318	common	getrandom		sys_getrandom
-319	common	memfd_create
-320	common	kexec_file_load
-321	common	bpf
-322	common	execveat
-323	common	userfaultfd
-324	common	membarrier
-325	common	mlock2			sys_host_mlock2
+319	common	memfd_create		sys_memfd_create
+320	common	kexec_file_load	sys_kexec_file_load
+321	common	bpf			sys_bpf
+322	common	execveat		sys_execveat
+323	common	userfaultfd		sys_userfaultfd
+324	common	membarrier		sys_membarrier
+325	common	mlock2			sys_mlock2
 326	common	copy_file_range	sys_copy_file_range
 327	common	preadv2			sys_preadv2
 328	common	pwritev2		sys_pwritev2
-329	common	pkey_mprotect
-330	common	pkey_alloc
-331	common	pkey_free
+329	common	pkey_mprotect		sys_flux_pkey_mprotect
+330	common	pkey_alloc		sys_flux_pkey_alloc
+331	common	pkey_free		sys_flux_pkey_free
 332	common	statx			sys_statx
-333	common	io_pgetevents
+333	common	io_pgetevents		sys_io_pgetevents
 334	common	rseq			sys_rseq
 # don't use numbers 387 through 423, add new calls after the last
 # 'common' entry
@@ -369,15 +371,17 @@
 437	common	openat2			sys_openat2
 438	common	pidfd_getfd		sys_pidfd_getfd
 439	common	faccessat2		sys_faccessat2
-440	common	process_madvise	sys_host_process_madvise
+440	common	process_madvise	sys_process_madvise
 441	common	epoll_pwait2	sys_epoll_pwait2
 442	common	mount_setattr   sys_mount_setattr
-443	common	quotactl_fd
-444	common	landlock_create_ruleset
-445	common	landlock_add_rule
-446	common	landlock_restrict_self
-447	common	memfd_secret
-448	common	process_mrelease sys_host_process_mrelease
+443	common	quotactl_fd		sys_quotactl_fd
+444	common	landlock_create_ruleset	sys_landlock_create_ruleset
+445	common	landlock_add_rule	sys_landlock_add_rule
+446	common	landlock_restrict_self	sys_landlock_restrict_self
+447	common	memfd_secret		sys_memfd_secret
+448	common	process_mrelease sys_flux_process_mrelease
 449	common	futex_waitv		sys_futex_waitv
-451	common	cachestat
+450	common	set_mempolicy_home_node	sys_set_mempolicy_home_node
+451	common	cachestat		sys_cachestat
 452	common	fchmodat2		sys_fchmodat2
+453	64	map_shadow_stack	sys_map_shadow_stack

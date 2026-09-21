@@ -12,6 +12,8 @@
 
 #define __ARCH_WANT_SYS_TIME
 #define __ARCH_WANT_SYS_UTIME
+#define __ARCH_WANT_SYS_FORK
+#define __ARCH_WANT_SYS_VFORK
 #define __ARCH_WANT_SYS_CLONE
 #define __ARCH_WANT_SYS_CLONE3
 #define __ARCH_WANT_SYS_WAITPID
@@ -25,13 +27,6 @@
 #define __ARCH_WANT_SYS_SIGPROCMASK
 #define __ARCH_WANT_SYS_GETPGRP
 
-/*
- * Flux intentionally leaves these syscalls unimplemented for now.
- * Mark them ignored so scripts/checksyscalls.sh stays quiet.
- */
-#define __IGNORE_inotify_init1
-#define __IGNORE_seccomp
-#define __IGNORE_set_mempolicy_home_node
 
 #else
 #error "Flux only supports x86_64"

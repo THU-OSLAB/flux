@@ -5,10 +5,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include <flux.h>
 
 #include "runc/runc.h"
+
+#define FLUX_RUNC_VERSION "0.1.0"
+#define FLUX_RUNC_BASE_COMMIT "6e3f15ecb70fdbb98520fbbe8582eebe7b6d6569"
+#define FLUX_RUNC_OCI_SPEC "1.3.0"
 
 struct flux_runc_global_opts {
 	const char *root;
@@ -23,7 +28,7 @@ static bool flux_runc_is_known_command(const char *arg)
 {
 	static const char *commands[] = {
 		"create", "start", "run", "state", "kill", "exec",
-		"features",
+		"features", "events", "stats", "update",
 		"ps", "list", "delete", "__exec",
 	};
 	size_t i;
@@ -90,23 +95,81 @@ static int flux_runc_write_all(int fd, const char *buf, size_t len)
 	return 0;
 }
 
-static int flux_runc_write_runtime_error(const char *path, int exit_code)
+static int flux_runc_escape_log_message(char *dst, size_t size,
+					const char *message)
 {
-	char buf[256];
+	size_t out = 0;
+	const unsigned char *p;
+
+	if (!dst || size == 0 || !message)
+		return -EINVAL;
+	for (p = (const unsigned char *)message; *p; p++) {
+		const char *replacement = NULL;
+
+		switch (*p) {
+		case '\\':
+			replacement = "\\\\";
+			break;
+		case '"':
+			replacement = "\\\"";
+			break;
+		case '\n':
+			replacement = "\\n";
+			break;
+		case '\r':
+			replacement = "\\r";
+			break;
+		case '\t':
+			replacement = "\\t";
+			break;
+		default:
+			break;
+		}
+		if (replacement) {
+			size_t len = strlen(replacement);
+
+			if (out + len >= size)
+				return -ENOSPC;
+			memcpy(dst + out, replacement, len);
+			out += len;
+		} else {
+			if (out + 1 >= size)
+				return -ENOSPC;
+			dst[out++] = *p < 0x20 ? '?' : (char)*p;
+		}
+	}
+	dst[out] = '\0';
+	return 0;
+}
+
+static int flux_runc_write_runtime_error(const char *path, int exit_code,
+					 const char *message)
+{
+	char escaped[1024];
+	char timestamp[64];
+	char buf[1400];
+	struct tm tm;
+	time_t now;
 	int fd;
 	int len;
 	int ret;
 
 	if (!path || !path[0])
 		return 0;
+	if (flux_runc_escape_log_message(escaped, sizeof(escaped), message) < 0)
+		return -ENOSPC;
+	now = time(NULL);
+	if (now == (time_t)-1 || !gmtime_r(&now, &tm) ||
+	    !strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &tm))
+		return -EINVAL;
 
 	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
 	if (fd < 0)
 		return -errno;
 
 	len = snprintf(buf, sizeof(buf),
-		       "{\"error\":\"flux-runc command failed\",\"exitStatus\":%d}\n",
-		       exit_code);
+		       "{\"level\":\"error\",\"msg\":\"%s\",\"time\":\"%s\",\"exitStatus\":%d}\n",
+		       escaped, timestamp, exit_code);
 	if (len < 0 || len >= (int)sizeof(buf)) {
 		close(fd);
 		return -EINVAL;
@@ -191,7 +254,14 @@ static int flux_runc_normalize_argv(int argc, char **argv, int *out_argc,
 	}
 
 	if (flux_runc_opts.version) {
-		fprintf(stdout, "flux-runc\n");
+		/* containerd/go-runc parses this compatibility prefix literally.
+		 * The version value still identifies this implementation as Flux. */
+		fprintf(stdout,
+			"runc version flux-runc-%s\n"
+			"commit: %s+task-overlay\n"
+			"spec: %s\n",
+			FLUX_RUNC_VERSION, FLUX_RUNC_BASE_COMMIT,
+			FLUX_RUNC_OCI_SPEC);
 		exit(0);
 	}
 
@@ -250,6 +320,9 @@ static void flux_runc_print_usage(void)
 	fprintf(stderr, "  kill     Deliver supported OCI signals\n");
 	fprintf(stderr, "  exec     Start an additional process inside a running container\n");
 	fprintf(stderr, "  features Print supported runtime feature metadata\n");
+	fprintf(stderr, "  events   Display resource events and statistics\n");
+	fprintf(stderr, "  stats    Display one resource statistics sample\n");
+	fprintf(stderr, "  update   Update container resource constraints\n");
 	fprintf(stderr, "  ps       Show container process ids\n");
 	fprintf(stderr, "  list     List known containers\n");
 	fprintf(stderr, "  delete   Remove container runtime state\n");
@@ -323,8 +396,8 @@ int main(int argc, char **argv)
 	}
 	if (ret != 0 && flux_runc_opts.log && flux_runc_opts.log_format &&
 	    !strcmp(flux_runc_opts.log_format, "json")) {
-		int log_ret = flux_runc_write_runtime_error(flux_runc_opts.log,
-							    ret);
+		int log_ret = flux_runc_write_runtime_error(
+			flux_runc_opts.log, ret, flux_runc_last_error());
 
 		if (log_ret < 0) {
 			FLUX_LOG(FLUX_LOG_ERR,

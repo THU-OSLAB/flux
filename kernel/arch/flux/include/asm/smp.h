@@ -59,33 +59,7 @@ void flux_shutdown(int cpu);
 void flux_cpu_exit(void);
 void flux_cpu_clock_init(int cpu);
 
-extern int flux_ipi_gate_open(void);
-
-int default_timer_init(void);
-
-/**
- * flux_run_on_cpu - run a function on a specific physical CPU
- */
-flux_thread_t flux_run_on_cpu(int cpu, void (*fn)(int), void *arg);
-
-enum { FLUX_NR_STATS = 32 };
-
-DECLARE_PER_CPU(uint64_t[2 * FLUX_NR_STATS], pcpu_stat);
-#define pcpu_stat_set(stat, val) (this_cpu_ptr(pcpu_stat)[stat] = val)
-#define pcpu_stat_inc(stat, inc) (this_cpu_ptr(pcpu_stat)[stat] += inc)
-#define pcpu_stat_get(stat) (this_cpu_ptr(pcpu_stat)[stat])
-#define pcpu_stat_foreach(n)                                              \
-	for (int i = 0; i < n; i++) {                                     \
-		flux_debug("CPU %d: %d=%llu\n", raw_smp_processor_id(), i, \
-			  this_cpu_ptr(pcpu_stat)[i]);                    \
-	}
-
-#define pcpu_stat_clear(n)                              \
-	do {                                            \
-		for (int i = 0; i < n; i++) {           \
-			this_cpu_ptr(pcpu_stat)[i] = 0; \
-		}                                       \
-	} while (0);
+extern int flux_ipi_init(void);
 
 static inline u64 now_tsc(void)
 {
@@ -102,15 +76,11 @@ void flux_tick_broadcast(int cpu);
 void flux_shutdown(int cpu);
 void flux_cpu_exit(void);
 void flux_cpu_clock_init(int cpu);
-int default_timer_init(void);
-
 #endif /* CONFIG_SMP */
 
 extern void flux_may_change_sched_class(struct task_struct *p);
 
-#ifdef CONFIG_FLUX_UINTR
 extern int uintr_timer_init(void);
-#endif /* CONFIG_FLUX_UINTR */
 
 #endif /* !__ASSEMBLY__ */
 

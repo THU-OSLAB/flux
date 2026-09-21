@@ -38,11 +38,23 @@ typedef struct {
 #error "Only x86_64 is supported in Flux"
 #endif
 
-#ifdef CONFIG_FLUX_UINTR
 
 #include <linux/types.h>
-#include <linux/list.h>
-#include <linux/spinlock.h>
+#include <linux/llist.h>
+
+struct pt_regs;
+struct flux_deferred_fault {
+	unsigned long address;
+	unsigned long error;
+	int code;
+	int signal;
+};
+
+void flux_take_deferred_fault(struct flux_deferred_fault *fault);
+void flux_complete_user_fault(struct pt_regs *regs,
+			      const struct flux_deferred_fault *fault);
+void flux_complete_kernel_fault(struct pt_regs *regs,
+				const struct flux_deferred_fault *fault);
 
 struct task_struct;
 struct pid;
@@ -53,22 +65,26 @@ struct flux_sig_entry {
 	unsigned int ctrl_arg;
 	int sig_code;
 	unsigned long sig_addr;
+	bool sig_has_info;
+	int sig_info_errno;
+	int sig_info_pid;
+	unsigned int sig_info_uid;
 	struct pid *sig_pid;
-	struct list_head sig_link;
+	struct llist_node sig_node;
 };
 
 struct flux_sig_list {
-	spinlock_t lock;
-	struct list_head head;
+	struct llist_head pending;
 };
 
-struct flux_sig_entry *flux_sig_take_entry(int cpu);
+struct llist_node *flux_sig_take_batch(int cpu);
 void flux_signal_register_init_task(struct task_struct *task);
 void flux_signal_unregister_init_task(struct task_struct *task);
 
 #ifdef CONFIG_FLUX_RUNC
 int flux_exec_init(void);
 void flux_exec_wake(void);
+void flux_exec_record_init_status(int status);
 #else
 static inline int flux_exec_init(void)
 {
@@ -76,31 +92,13 @@ static inline int flux_exec_init(void)
 }
 
 static inline void flux_exec_wake(void)
+{
+}
+
+static inline void flux_exec_record_init_status(int status)
 {
 }
 #endif
 
-#else
-
-struct task_struct;
-
-static inline void flux_signal_register_init_task(struct task_struct *task)
-{
-}
-
-static inline void flux_signal_unregister_init_task(struct task_struct *task)
-{
-}
-
-static inline int flux_exec_init(void)
-{
-	return 0;
-}
-
-static inline void flux_exec_wake(void)
-{
-}
-
-#endif /* CONFIG_FLUX_UINTR */
 
 #endif /* _ASM_FLUX_SIGNAL_H */

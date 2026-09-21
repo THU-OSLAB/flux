@@ -1,0 +1,49 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _ASM_FLUX_FAULT_STATS_H
+#define _ASM_FLUX_FAULT_STATS_H
+
+#include <linux/compiler.h>
+
+enum flux_fault_event {
+	FLUX_FAULT_HOST_USER_READ,
+	FLUX_FAULT_HOST_USER_WRITE,
+	FLUX_FAULT_HOST_USER_EXEC,
+	FLUX_FAULT_HOST_VMALLOC,
+	FLUX_FAULT_HOST_OTHER_ADDRESS,
+	FLUX_FAULT_HOST_NESTED,
+	FLUX_FAULT_ATOMIC_NO_STATE,
+	FLUX_FAULT_ATOMIC_ACCESS_BLOCKED,
+	FLUX_FAULT_ATOMIC_INSTALL_FAILED,
+	FLUX_FAULT_ATOMIC_STATE_CHANGED,
+	FLUX_FAULT_ATOMIC_REPAIRED,
+	FLUX_FAULT_BLOCKING_REPAIRED,
+	FLUX_FAULT_BLOCKING_FAILED,
+	FLUX_FAULT_MM_MISSING_READ,
+	FLUX_FAULT_MM_MISSING_WRITE,
+	FLUX_FAULT_MM_MISSING_EXEC,
+	FLUX_FAULT_MM_PRESENT_WRITE,
+	FLUX_FAULT_MM_PRESENT_OTHER,
+	FLUX_FAULT_RESOLVER_RETRY,
+	FLUX_FAULT_RESOLVER_ERROR,
+	FLUX_FAULT_VMA_DENIED,
+	FLUX_FAULT_VMA_MISSING,
+	FLUX_FAULT_ATOMIC_GUARD,
+	FLUX_FAULT_EVENT_COUNT,
+};
+
+#ifdef CONFIG_FLUX_FAULT_STATS
+extern bool flux_fault_stats_enabled;
+void __flux_fault_note(enum flux_fault_event event);
+
+static inline void flux_fault_note(enum flux_fault_event event)
+{
+	if (unlikely(READ_ONCE(flux_fault_stats_enabled)))
+		__flux_fault_note(event);
+}
+#else
+static inline void flux_fault_note(enum flux_fault_event event)
+{
+}
+#endif
+
+#endif /* _ASM_FLUX_FAULT_STATS_H */

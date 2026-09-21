@@ -98,13 +98,15 @@ static inline void __iomem *ioremap(phys_addr_t offset, size_t size)
 	return (void __iomem *)flux_ops_ioremap(offset, size);
 }
 
-#ifdef CONFIG_MMU
 static inline void __iounmap(void __iomem *addr)
 {
 	// No-op according to ioremap implementation.
 }
 #define iounmap __iounmap
-#endif
+
+#define ARCH_HAS_VALID_PHYS_ADDR_RANGE
+extern int valid_phys_addr_range(phys_addr_t addr, size_t size);
+extern int valid_mmap_phys_addr_range(unsigned long pfn, size_t size);
 
 #include <asm-generic/io.h>
 

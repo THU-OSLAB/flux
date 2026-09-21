@@ -930,6 +930,16 @@ static void __init memmap_init(void)
 	unsigned long hole_pfn = 0;
 	int i, j, zone_id = 0, nid;
 
+#if defined(CONFIG_FLUX) && defined(CONFIG_SPARSEMEM)
+	/* Flux's physical window starts at a high userspace address. There
+	 * are no memory sections below it; walking that leading hole one
+	 * pageblock at a time can dwarf initialization of actual memory.
+	 * Keep any leading hole inside the first section for normal reserved
+	 * page initialization, and leave all subsequent holes unchanged.
+	 */
+	hole_pfn = round_down(ARCH_PFN_OFFSET, PAGES_PER_SECTION);
+#endif
+
 	for_each_mem_pfn_range(i, MAX_NUMNODES, &start_pfn, &end_pfn, &nid) {
 		struct pglist_data *node = NODE_DATA(nid);
 

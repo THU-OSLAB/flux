@@ -13,8 +13,10 @@
 #include <uapi/linux/audit.h>
 #include <linux/sched.h>
 #include <linux/err.h>
+#include <asm/host_ops.h>
 #include <asm/thread_info.h> /* for TS_COMPAT */
 #include <asm/unistd.h>
+#include <asm/x86/processor.h>
 
 typedef long (*syscall_ptr_t)(long a1, ...);
 
@@ -71,9 +73,16 @@ static inline void syscall_get_arguments(struct task_struct *task,
 }
 
 void syscall_ret_to_user(struct pt_regs *regs);
-void syscall_ret_to_env(struct pt_regs *regs);
+extern char __flux_syscall_ret_to_user_end[];
 
-void syscall_fast_do_signal_or_restart(struct pt_regs *regs);
+static __always_inline bool
+flux_syscall_on_user_return_path(unsigned long ip)
+{
+	return ip >= (unsigned long)syscall_ret_to_user &&
+	       ip < (unsigned long)__flux_syscall_ret_to_user_end;
+}
+
+void syscall_ret_to_env(struct pt_regs *regs);
 
 long flux_fork(unsigned long clone_flags, unsigned long newsp,
 	       void __user *parent_tidptr, void __user *child_tidptr,

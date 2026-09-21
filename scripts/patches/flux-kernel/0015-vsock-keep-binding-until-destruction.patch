@@ -1,0 +1,38 @@
+From: Michal Luczaj <mhal@rbox.co>
+Subject: [PATCH] vsock: Keep the binding until socket destruction
+
+Fix the lifetime of bindings in the vsock functionality already present in
+Linux 6.6. This adds no new UAPI or post-6.6 functionality. Backport of
+upstream fcdd2242c0231032fc84e1404315c245ae56322a and Linux 6.6 stable
+3f43540166128951cc1be7ab1ce6b7f05c670d8b. Kept as a build-time patch so the
+non-arch source remains identical to the unpatched primary and reference.
+
+--- a/kernel/net/vmw_vsock/af_vsock.c
++++ b/kernel/net/vmw_vsock/af_vsock.c
+@@ -332,7 +332,10 @@
+ 
+ void vsock_remove_sock(struct vsock_sock *vsk)
+ {
+-	vsock_remove_bound(vsk);
++	/* Transport reassignment must not remove the binding. */
++	if (sock_flag(sk_vsock(vsk), SOCK_DEAD))
++		vsock_remove_bound(vsk);
++
+ 	vsock_remove_connected(vsk);
+ }
+ EXPORT_SYMBOL_GPL(vsock_remove_sock);
+@@ -808,12 +811,13 @@
+ 		 */
+ 		lock_sock_nested(sk, level);
+ 
++		sock_orphan(sk);
++
+ 		if (vsk->transport)
+ 			vsk->transport->release(vsk);
+ 		else if (sock_type_connectible(sk->sk_type))
+ 			vsock_remove_sock(vsk);
+ 
+-		sock_orphan(sk);
+ 		sk->sk_shutdown = SHUTDOWN_MASK;
+ 
+ 		skb_queue_purge(&sk->sk_receive_queue);

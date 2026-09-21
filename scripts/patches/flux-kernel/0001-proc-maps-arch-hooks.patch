@@ -1,0 +1,43 @@
+From: Flux architecture integration
+Subject: [PATCH] proc: retain the Flux architecture maps query ioctl
+
+Runtime mappings are now normal special VMAs. Keep native Linux maps and
+smaps iteration; retain only the existing architecture query ioctl hook.
+
+--- a/kernel/fs/proc/task_mmu.c
++++ b/kernel/fs/proc/task_mmu.c
+@@ -21,6 +21,9 @@
+ #include <linux/uaccess.h>
+ #include <linux/pkeys.h>
+ 
++#ifdef CONFIG_ARCH_HAS_PROC_MAPS
++#include <asm/proc_maps.h>
++#endif
+ #include <asm/elf.h>
+ #include <asm/tlb.h>
+ #include <asm/tlbflush.h>
+@@ -355,10 +358,24 @@
+ 	return do_maps_open(inode, file, &proc_pid_maps_op);
+ }
+ 
++#ifdef CONFIG_ARCH_HAS_PROC_MAPS
++static long proc_pid_maps_ioctl(struct file *file, unsigned int cmd,
++				unsigned long arg)
++{
++	struct seq_file *seq = file->private_data;
++	struct proc_maps_private *priv = seq->private;
++
++	return arch_proc_maps_ioctl(priv->mm, cmd, arg);
++}
++#endif
++
+ const struct file_operations proc_pid_maps_operations = {
+ 	.open		= pid_maps_open,
+ 	.read		= seq_read,
+ 	.llseek		= seq_lseek,
++#ifdef CONFIG_ARCH_HAS_PROC_MAPS
++	.unlocked_ioctl	= proc_pid_maps_ioctl,
++#endif
+ 	.release	= proc_map_release,
+ };
+ 

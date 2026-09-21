@@ -11,8 +11,8 @@ void smp_prepare_cpus(unsigned int max_cpus)
 {
 	int cpu;
 
-	if (flux_ipi_gate_open())
-		panic("flux: failed to open ipi gate\n");
+	if (flux_ipi_init())
+		panic("flux: failed to initialize IPIs\n");
 
 	cpu = smp_processor_id();
 	numa_store_cpu_info(cpu);

@@ -16,6 +16,7 @@ enum flux_log_level {
 extern void logk(int level, const char *fmt, ...)
 	__attribute__((__format__(__printf__, 2, 3)));
 extern void logk_backtrace(void);
+extern bool flux_stdout_needs_crlf(void);
 
 #if defined(LOG_LEVEL_DEBUG) || defined(DEBUG)
 #define MAX_LOG_LEVEL FLUX_LOG_DEBUG

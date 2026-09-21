@@ -1,4 +1,4 @@
 libflux-y += memory.o ops.o cpu.o kmod.o signal.o malloc.o
-libflux-$(CONFIG_FLUX_MPK) += signal_entry.o
+libflux-y += signal_entry.o
 
-libflux-$(CONFIG_FLUX_UINTR) += uintr.o
+libflux-y += uintr.o

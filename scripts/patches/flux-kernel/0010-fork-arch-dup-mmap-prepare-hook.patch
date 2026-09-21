@@ -1,0 +1,38 @@
+From: Flux architecture integration
+Subject: [PATCH] fork: pair architecture mmap preparation and completion
+
+Prepare host COW before copy_page_range, under both mmap write locks.
+Complete on every prepared exit, under the parent mmap write lock. The
+optional completion supplies the fork TLB synchronization and can report
+failure; architectures without it retain flush_tlb_mm unchanged.
+
+Flux's host gate write-protects and flushes aliases. Keep those aliases
+instead of revoking and reconstructing the entire parent address space.
+Ordinary Linux invalidation paths are unchanged.
+
+--- a/kernel/kernel/fork.c
++++ b/kernel/kernel/fork.c
+@@ -664,6 +664,11 @@
+ 	 * Not linked in yet - no deadlock potential:
+ 	 */
+ 	mmap_write_lock_nested(mm, SINGLE_DEPTH_NESTING);
++#ifdef arch_dup_mmap_prepare
++	retval = arch_dup_mmap_prepare(oldmm, mm);
++	if (retval)
++		goto out;
++#endif
+ 
+ 	/* No ordering required: file already has been exposed. */
+ 	dup_mm_exe_file(mm, oldmm);
+@@ -771,7 +776,11 @@
+ 		mt_set_in_rcu(vmi.mas.tree);
+ out:
+ 	mmap_write_unlock(mm);
++#ifdef arch_dup_mmap_finish
++	retval = arch_dup_mmap_finish(oldmm, mm, retval);
++#else
+ 	flush_tlb_mm(oldmm);
++#endif
+ 	mmap_write_unlock(oldmm);
+ 	dup_userfaultfd_complete(&uf);
+ fail_uprobe_end:

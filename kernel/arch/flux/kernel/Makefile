@@ -4,6 +4,7 @@ KASAN_SANITIZE_init.o := n
 KASAN_SANITIZE_stacktrace.o := n
 
 obj-y = setup.o \
+	exec.o \
 	misc.o \
 	console.o \
 	stacktrace.o \
@@ -11,17 +12,15 @@ obj-y = setup.o \
 	reboot.o \
 	host_dev.o \
 	host_fs.o \
-	signal.o
+	proc_maps.o \
+	signal.o \
+	vdso.o \
+	vdso/
 
 obj-$(CONFIG_FLUX_RUNC) += execd.o
 
-obj-$(CONFIG_SMP) += smp.o smpboot.o
+obj-$(CONFIG_MODULES) += module.o
+
+obj-$(CONFIG_SMP) += smpboot.o
 
 obj-$(CONFIG_X86_64) += x86/
-
-obj-$(CONFIG_FLUX_UINTR) += signal.o
-
-# use default timer if uintr is not enabled
-ifneq ($(CONFIG_FLUX_UINTR),y)
-obj-y += timer-pcpu.o irq.o
-endif

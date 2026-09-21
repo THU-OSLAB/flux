@@ -46,6 +46,15 @@ enum flux_cfg_option {
 	OPT_DUMP,
 	OPT_MEM_SIZE,
 	OPT_DMA_SIZE,
+	OPT_NR_CPUS,
+	OPT_CPU_SET,
+	OPT_CPU_SHARES,
+	OPT_CPU_QUOTA,
+	OPT_CPU_PERIOD,
+	OPT_PID_LIMIT,
+	OPT_BLKIO_WEIGHT,
+	OPT_NETWORK_CLASS_ID,
+	OPT_NETWORK_PRIORITY,
 	OPT_SPDK_BDF,
 	OPT_SPDK_ZERO_COPY,
 	OPT_SPDK_FS_TYPE,
@@ -83,6 +92,24 @@ struct flux_cfg_entry {
 	      "Size of normal kernel memory passed via boot cmdline")        \
 	X_STR(dma_size, "dma_size", OPT_DMA_SIZE,                            \
 	      "Size of the kernel DMA zone passed via boot cmdline")         \
+	X_STR(nr_cpus, "nr_cpus", OPT_NR_CPUS,                              \
+	      "Number of Flux CPUs requested from iokd")                     \
+	X_STR(cpu_set, "cpu_set", OPT_CPU_SET,                              \
+	      "Exact host CPU set requested from iokd")                      \
+	X_STR(cpu_shares, "cpu_shares", OPT_CPU_SHARES,                     \
+	      "Relative iokd CPU scheduling weight")                         \
+	X_STR(cpu_quota, "cpu_quota", OPT_CPU_QUOTA,                        \
+	      "Per-period iokd CPU service quota")                           \
+	X_STR(cpu_period, "cpu_period", OPT_CPU_PERIOD,                     \
+	      "iokd CPU service quota period")                               \
+	X_STR(pid_limit, "pid_limit", OPT_PID_LIMIT,                        \
+	      "Maximum Flux application process count")                     \
+	X_STR(blkio_weight, "blkio_weight", OPT_BLKIO_WEIGHT,               \
+	      "Flux I/O scheduling weight")                                 \
+	X_STR(network_class_id, "network_class_id", OPT_NETWORK_CLASS_ID,   \
+	      "Flux network scheduling class")                              \
+	X_STR(network_priority, "network_priority", OPT_NETWORK_PRIORITY,   \
+	      "Flux network interface priority")                            \
 	X_LIST(spdk_bdf, spdk_dev_num, "spdk_bdf", OPT_SPDK_BDF,             \
 	       "SPDK block device BDF")                                      \
 	X_STR(spdk_zero_copy, "spdk_zero_copy", OPT_SPDK_ZERO_COPY,          \
@@ -103,11 +130,11 @@ struct flux_cfg_entry {
 	X_LIST(env, env_num, "env", OPT_ENV,                                 \
 	       "Environment entry in VAR=VAL format")                        \
 	X_STR(nic_ip_addr, "nic_ip_addr", OPT_NIC_IP_ADDR,                   \
-	      "Guest NIC IP address")                                        \
+	      "Flux NIC IP address")                                        \
 	X_STR(nic_ip_gw, "nic_ip_gw", OPT_NIC_IP_GW,                         \
-	      "Guest NIC gateway address")                                   \
+	      "Flux NIC gateway address")                                   \
 	X_STR(nic_ip_mask, "nic_ip_mask", OPT_NIC_IP_MASK,                   \
-	      "Guest NIC subnet mask")                                       \
+	      "Flux NIC subnet mask")                                       \
 	X_STR(iok_sock_path, "iok_sock_path", OPT_IOK_SOCK_PATH,             \
 	      "External iokd control socket path")
 
@@ -143,7 +170,7 @@ static void flux_run_cfg_print_usage(void)
 	printf("Options:\n");
 	printf("  -c, --run-cfg <file>       Run cfg JSON file\n");
 	printf("  -h, --help                 Print this help message\n");
-	printf("      --multiproc            Enable multiprocess bootstrap mode\n");
+	printf("      --multiproc            Accepted for compatibility; bootstrap is always enabled\n");
 	for (size_t i = 0; i < ARRAY_SIZE(flux_cfg_entries); i++) {
 		const struct flux_cfg_entry *entry = &flux_cfg_entries[i];
 		size_t opt_len = strlen(entry->long_opt) + strlen("--") +
@@ -361,7 +388,7 @@ int flux_run_cfg_parse_args(int argc, char **argv)
 			flux_run_cfg_print_usage();
 			return 1;
 		case OPT_MULTIPROC:
-			flux_env.multiproc_enabled = true;
+			/* All processes use the same host-mm bootstrap. */
 			break;
 		default:
 			entry = flux_cfg_find_by_opt(opt);

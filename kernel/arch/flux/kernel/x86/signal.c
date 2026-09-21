@@ -2,7 +2,6 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/sched.h>
-#include <linux/sched/task_stack.h>
 #include <linux/mm.h>
 #include <linux/smp.h>
 #include <linux/kernel.h>
@@ -19,6 +18,7 @@
 #include <linux/entry-common.h>
 #include <linux/syscalls.h>
 #include <asm/processor.h>
+#include <asm/mpk_uaccess.h>
 #include <asm/ucontext.h>
 #include <uapi/asm/signal.h>
 #include <asm/signal.h>
@@ -63,13 +63,6 @@ void __user *get_sigframe(struct ksignal *ksig, struct pt_regs *regs,
 	/* redzone */
 	sp -= 128;
 
-	/* reserve space for pt_regs of uintr */
-	if (test_thread_flag(TIF_UINTR_FROM_USER)) {
-		sp -= sizeof(struct pt_regs);
-		sp = round_down(sp, FRAME_ALIGNMENT);
-		WARN_ON(sp > (unsigned long)regs);
-	}
-
 	/* This is the X/Open sanctioned signal stack switching.  */
 	if (ka->sa.sa_flags & SA_ONSTACK) {
 		/*
@@ -107,14 +100,17 @@ void __user *get_sigframe(struct ksignal *ksig, struct pt_regs *regs,
 	if (!access_ok(*fpstate, math_size))
 		return (void __user *)-1L;
 
-	if (test_thread_flag(TIF_NEED_FPU_LOAD)) {
-		restore_xstate(task_xstate(current));
-		clear_thread_flag(TIF_NEED_FPU_LOAD);
+	/*
+	 * Keep the task image authoritative across user copies that may fault or
+	 * schedule. UINTR/raw-syscall entry already saved it; a C-call syscall may
+	 * still have live state. Never restore registers just to save them again.
+	 */
+	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
+		save_xstate_full(task_xstate(current));
+		set_thread_flag(TIF_NEED_FPU_LOAD);
 	}
-
-	if (__clear_user(&xbuf->header, sizeof(xbuf->header)))
+	if (copy_to_user(xbuf, task_xstate(current), flux_xstate_copy_size))
 		return (void __user *)-1L;
-	save_xstate((void *)xbuf);
 
 	return (void __user *)sp;
 }
@@ -156,7 +152,8 @@ __unsafe_setup_sigcontext(struct sigcontext __user *sc, void __user *fpstate,
 	unsafe_put_user(0, &sc->trapno, efault);
 	unsafe_put_user(0, &sc->err, efault);
 	unsafe_put_user(regs->ip, &sc->ip, efault);
-	unsafe_put_user(regs->flags, &sc->flags, efault);
+	/* The upper half also carries Flux software mode, not user RFLAGS. */
+	unsafe_put_user((unsigned long)regs->eflags, &sc->flags, efault);
 	unsafe_put_user(0x33, &sc->cs, efault);
 	unsafe_put_user(0, &sc->gs, efault);
 	unsafe_put_user(0, &sc->fs, efault);
@@ -237,12 +234,15 @@ fault:
 	return -EFAULT;
 }
 
-// #define RESTART_SYSCALL_INSTRUCTION_SIZE 2
-/* ff 14 25 00 00 10 00 	call   *0x100000 */
-/* ff 14 25 08 00 10 00 	call   *0x100008 */
 #define RESTART_SYSCALL_INSTRUCTION_SIZE 7
 
-static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
+static inline unsigned long restart_syscall_instruction_size(
+	const struct pt_regs *regs)
+{
+	return regs->uirrv ? 2 : RESTART_SYSCALL_INSTRUCTION_SIZE;
+}
+
+static bool handle_signal(struct ksignal *ksig, struct pt_regs *regs)
 {
 	bool failed;
 
@@ -263,7 +263,7 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
 			fallthrough;
 		case -ERESTARTNOINTR:
 			regs->ax = regs->orig_ax;
-			regs->ip -= RESTART_SYSCALL_INSTRUCTION_SIZE;
+			regs->ip -= restart_syscall_instruction_size(regs);
 			break;
 		}
 	}
@@ -281,6 +281,9 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
 		 * avoid the recursive send_sigtrap() in SIGTRAP handler.
 		 */
 		regs->flags &= ~(X86_EFLAGS_DF | X86_EFLAGS_RF | X86_EFLAGS_TF);
+	}
+
+	if (!failed) {
 		/*
 		 * Ensure the signal handler starts with the new fpu state.
 		 */
@@ -288,6 +291,8 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
 		set_thread_flag(TIF_NEED_FPU_LOAD);
 	}
 	signal_setup_done(failed, ksig, false);
+
+	return failed;
 }
 
 /*
@@ -313,12 +318,12 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
 		case -ERESTARTSYS:
 		case -ERESTARTNOINTR:
 			regs->ax = regs->orig_ax;
-			regs->ip -= RESTART_SYSCALL_INSTRUCTION_SIZE;
+			regs->ip -= restart_syscall_instruction_size(regs);
 			break;
 
 		case -ERESTART_RESTARTBLOCK:
 			regs->ax = __NR_restart_syscall;
-			regs->ip -= RESTART_SYSCALL_INSTRUCTION_SIZE;
+			regs->ip -= restart_syscall_instruction_size(regs);
 			break;
 		}
 	}
@@ -328,58 +333,6 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
 	 * back.
 	 */
 	restore_saved_sigmask();
-}
-
-static inline void syscall_fast_ret_to_user(struct pt_regs *regs)
-{
-	local_irq_disable_exit_to_user();
-	if (test_thread_flag(TIF_NEED_FPU_LOAD)) {
-		restore_xstate(task_xstate(current));
-		clear_thread_flag(TIF_NEED_FPU_LOAD);
-	}
-	arch_exit_to_user_mode();
-	syscall_ret_to_user(regs);
-}
-
-void syscall_fast_do_signal_or_restart(struct pt_regs *regs)
-{
-	struct ksignal ksig;
-	bool restart = false;
-
-	if (get_signal(&ksig)) {
-		/* Whee! Actually deliver the signal.  */
-		handle_signal(&ksig, regs);
-		syscall_fast_ret_to_user(regs);
-	}
-
-	/* Did we come from a system call? */
-	if (syscall_get_nr(current, regs) != -1) {
-		/* Restart the system call - no handlers present */
-		switch (syscall_get_error(current, regs)) {
-		case -ERESTARTNOHAND:
-		case -ERESTARTSYS:
-		case -ERESTARTNOINTR:
-			regs->ax = regs->orig_ax;
-			regs->ip -= RESTART_SYSCALL_INSTRUCTION_SIZE;
-			restart = true;
-			break;
-
-		case -ERESTART_RESTARTBLOCK:
-			regs->ax = __NR_restart_syscall;
-			regs->ip -= RESTART_SYSCALL_INSTRUCTION_SIZE;
-			restart = true;
-			break;
-		}
-	}
-
-	/*
-	 * If there's no signal to deliver, we just put the saved sigmask
-	 * back.
-	 */
-	restore_saved_sigmask();
-
-	if (restart)
-		syscall_fast_ret_to_user(regs);
 }
 
 void signal_fault(struct pt_regs *regs, void __user *frame, char *where)
@@ -414,6 +367,8 @@ bool restore_fpstate(void __user *buf)
 		set_thread_flag(TIF_NEED_FPU_LOAD);
 
 	if (copy_from_user(task_xstate(current), buf, size))
+		goto out;
+	if (!xstate_header_valid(task_xstate(current)))
 		goto out;
 
 	return true;

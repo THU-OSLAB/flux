@@ -19,7 +19,7 @@ struct rte_mempool;
 struct rte_mbuf;
 struct rte_hash;
 
-#define FLUX_IOKD_MAX_CLIENTS 1
+#define FLUX_IOKD_MAX_CLIENTS 8
 #define FLUX_IOKD_RX_PREFETCH_STRIDE 2
 #define FLUX_IOKD_CTRL_BACKLOG 64
 
@@ -33,6 +33,7 @@ struct flux_iokd_config {
 	bool tx_copy;
 	bool tx_chksum_offload;
 	bool no_network;
+	bool mlx5_external;
 };
 
 struct flux_iokd_dma_map {
@@ -52,6 +53,7 @@ struct flux_iokd_pcpu {
 struct flux_iokd_client {
 	pthread_t control_thread;
 	bool control_thread_started;
+	bool mlx5_clean_shutdown;
 	int id;
 	int fd;
 	bool ready;
@@ -59,10 +61,20 @@ struct flux_iokd_client {
 	bool retire_requested;
 	unsigned int refcnt;
 	pid_t peer_pid;
+	uid_t peer_uid;
 	bool cpu_assignment_active;
 	uint32_t ip_addr;
 	uint32_t netmask;
 	uint32_t gateway;
+	uint32_t io_weight;
+	uint32_t net_class_id;
+	uint32_t net_priority;
+	uint32_t cpu_shares;
+	int64_t cpu_quota;
+	uint64_t cpu_period;
+	uint64_t tx_deficit;
+	uint64_t tx_quota_window_start_ns;
+	uint64_t tx_quota_used_ns;
 	int nr_cpus;
 	int cpu_list[CONFIG_FLUX_MAX_CPUS];
 	uintptr_t window_base;
@@ -75,10 +87,15 @@ struct flux_iokd_client {
 	struct flux_iokd_pcpu pcpus[CONFIG_FLUX_MAX_CPUS];
 	struct rte_mbuf *owned_rx_bufs;
 	struct flux_iokd_dma_map *dma_maps;
+	void *mlx5;
 	size_t tx_comp_nr_ofs;
 	size_t tx_comp_max_ofs;
 	unsigned long *tx_comp_ofq;
 	unsigned int tx_next_cpu_rr;
+	uint64_t rx_packets;
+	uint64_t rx_bytes;
+	uint64_t tx_packets;
+	uint64_t tx_bytes;
 	struct flux_iokd_client *pending_reg_next;
 	struct flux_iokd_client *pending_unreg_next;
 	struct flux_iokd_client *retired_next;
@@ -101,6 +118,8 @@ struct flux_iokd_pkt {
 	uint16_t hash;
 	uint8_t olflags;
 };
+
+uint32_t flux_iokd_client_tx_quantum(const struct flux_iokd_client *client);
 
 struct flux_iokd {
 	int listen_fd;
@@ -132,14 +151,14 @@ struct flux_iokd {
 	bool fnet_is_tap;
 	bool tx_chksum_offload;
 	bool tx_comp_pending;
+	void *mlx5_device;
 };
 
 extern struct flux_iokd_config flux_iokd_cfg;
 extern struct flux_iokd flux_iokd;
 extern struct flux_shm *flux_shm;
 
-static inline struct flux_iokd_client *
-flux_iokd_client_load(int idx)
+static inline struct flux_iokd_client *flux_iokd_client_load(int idx)
 {
 	return atomic_load_acquire(&flux_iokd.clients[idx]);
 }
@@ -150,8 +169,7 @@ static inline void flux_iokd_client_store(int idx,
 	atomic_store_release(&flux_iokd.clients[idx], client);
 }
 
-static inline bool
-flux_iokd_client_ready(const struct flux_iokd_client *client)
+static inline bool flux_iokd_client_ready(const struct flux_iokd_client *client)
 {
 	return atomic_load_acquire(&client->ready);
 }
@@ -172,6 +190,74 @@ void flux_iokd_kmod_fini_sender(void);
 int flux_iokd_fnet_init(void);
 void flux_iokd_fnet_stop(void);
 void flux_iokd_fnet_fini(void);
+
+#ifdef CONFIG_FLUX_FNET
+int flux_iokd_mlx5_init(void);
+void flux_iokd_mlx5_fini(void);
+int flux_iokd_mlx5_client_prepare(struct flux_iokd_client *client,
+				  struct flux_iok_ctrl_mlx5_prepare *reply,
+				  int fds[2]);
+int flux_iokd_mlx5_dma_map_done(
+	struct flux_iokd_client *client,
+	const struct flux_iok_ctrl_mlx5_dma_map_done *req);
+int flux_iokd_mlx5_client_ready(struct flux_iokd_client *client,
+				const struct flux_iok_ctrl_mlx5_ready *req);
+int flux_iokd_mlx5_client_quiesce(struct flux_iokd_client *client);
+void flux_iokd_mlx5_client_destroy(struct flux_iokd_client *client);
+bool flux_iokd_mlx5_dma_range_busy(const struct flux_iokd_client *client,
+				   uintptr_t addr, size_t len);
+#else
+static inline int
+flux_iokd_mlx5_client_prepare(struct flux_iokd_client *client,
+			      struct flux_iok_ctrl_mlx5_prepare *reply,
+			      int fds[2])
+{
+	(void)client;
+	(void)reply;
+	(void)fds;
+	return -1;
+}
+
+static inline int
+flux_iokd_mlx5_dma_map_done(struct flux_iokd_client *client,
+			    const struct flux_iok_ctrl_mlx5_dma_map_done *req)
+{
+	(void)client;
+	(void)req;
+	return -1;
+}
+
+static inline int
+flux_iokd_mlx5_client_ready(struct flux_iokd_client *client,
+			    const struct flux_iok_ctrl_mlx5_ready *req)
+{
+	(void)client;
+	(void)req;
+	return -1;
+}
+
+static inline int flux_iokd_mlx5_client_quiesce(struct flux_iokd_client *client)
+{
+	(void)client;
+	return -1;
+}
+
+static inline void
+flux_iokd_mlx5_client_destroy(struct flux_iokd_client *client)
+{
+	(void)client;
+}
+
+static inline bool
+flux_iokd_mlx5_dma_range_busy(const struct flux_iokd_client *client,
+			      uintptr_t addr, size_t len)
+{
+	(void)client;
+	(void)addr;
+	(void)len;
+	return false;
+}
+#endif
 
 int flux_iokd_control_init(void);
 int flux_iokd_control_start(void);
@@ -215,14 +301,18 @@ flux_iokd_rx_client_queue_unregister(struct flux_iokd_client *client)
 	(void)client;
 }
 
-static inline void flux_iokd_rx_process_pending_clients(void) {}
+static inline void flux_iokd_rx_process_pending_clients(void)
+{
+}
 
 static inline bool flux_iokd_tx_burst(void)
 {
 	return false;
 }
 
-static inline void flux_iokd_tx_shutdown_flush(void) {}
+static inline void flux_iokd_tx_shutdown_flush(void)
+{
+}
 
 static inline bool flux_iokd_drain_completions(void)
 {
@@ -234,9 +324,8 @@ static inline bool flux_iokd_commands_rx(void)
 	return false;
 }
 
-static inline bool
-flux_iokd_rx_mbuf_deliver(struct flux_iokd_client *client, int cpu_idx,
-			       struct rte_mbuf *buf)
+static inline bool flux_iokd_rx_mbuf_deliver(struct flux_iokd_client *client,
+					     int cpu_idx, struct rte_mbuf *buf)
 {
 	(void)client;
 	(void)cpu_idx;
@@ -244,9 +333,8 @@ flux_iokd_rx_mbuf_deliver(struct flux_iokd_client *client, int cpu_idx,
 	return false;
 }
 
-static inline void
-flux_iokd_rx_mbuf_complete(struct flux_iokd_client *client,
-			   unsigned long payload)
+static inline void flux_iokd_rx_mbuf_complete(struct flux_iokd_client *client,
+					      unsigned long payload)
 {
 	(void)client;
 	(void)payload;

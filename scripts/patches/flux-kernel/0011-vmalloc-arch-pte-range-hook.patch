@@ -1,0 +1,48 @@
+From: Flux architecture integration
+Subject: [PATCH] vmalloc: install and revoke architecture PTE ranges
+
+Keep native page-table allocation, traversal and modification tracking.
+Optional paired range hooks project and revoke host aliases without relaxing
+the generic set_ptes same-folio contract.
+
+--- a/kernel/mm/vmalloc.c
++++ b/kernel/mm/vmalloc.c
+@@ -324,10 +324,15 @@
+ 	pte_t *pte;
+ 
+ 	pte = pte_offset_kernel(pmd, addr);
++
++#ifdef arch_vunmap_pte_range
++	arch_vunmap_pte_range(pte, addr, end);
++#else
+ 	do {
+ 		pte_t ptent = ptep_get_and_clear(&init_mm, addr, pte);
+ 		WARN_ON(!pte_none(ptent) && !pte_present(ptent));
+ 	} while (pte++, addr += PAGE_SIZE, addr != end);
++#endif
+ 	*mask |= PGTBL_PTE_MODIFIED;
+ }
+ 
+@@ -469,6 +474,14 @@
+ 	pte = pte_alloc_kernel_track(pmd, addr, mask);
+ 	if (!pte)
+ 		return -ENOMEM;
++#ifdef arch_vmap_pte_range
++	{
++		int err = arch_vmap_pte_range(pte, addr, end, prot, pages, nr);
++
++		if (err)
++			return err;
++	}
++#else
+ 	do {
+ 		struct page *page = pages[*nr];
+ 
+@@ -482,6 +495,7 @@
+ 		set_pte_at(&init_mm, addr, pte, mk_pte(page, prot));
+ 		(*nr)++;
+ 	} while (pte++, addr += PAGE_SIZE, addr != end);
++#endif
+ 	*mask |= PGTBL_PTE_MODIFIED;
+ 	return 0;
+ }

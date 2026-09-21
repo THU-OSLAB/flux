@@ -1,0 +1,34 @@
+From: Flux LTP compatibility work
+Subject: [PATCH] mm, mmap: fix vma_merge() case 7 with vma_ops->close
+
+Backport upstream commit fc0c8f9089c20d198d8fe51ddc28bfa1af588dce
+("mm, mmap: fix vma_merge() case 7 with vma_ops->close").  The imported
+Linux 6.6 mmap code can remove a SysV SHM VMA with a close callback in
+merge case 7 without invoking that callback, leaving shm_nattch elevated.
+
+diff --git a/kernel/mm/mmap.c b/kernel/mm/mmap.c
+--- a/kernel/mm/mmap.c
++++ b/kernel/mm/mmap.c
+@@ -949,13 +949,21 @@ static struct vm_area_struct
+ 	} else if (merge_prev) {			/* case 2 */
+ 		if (curr) {
+ 			vma_start_write(curr);
+-			err = dup_anon_vma(prev, curr, &anon_dup);
+ 			if (end == curr->vm_end) {	/* case 7 */
++				/*
++				 * can_vma_merge_after() assumed we would not be
++				 * removing prev vma, so it skipped the check
++				 * for vm_ops->close, but we are removing curr
++				 */
++				if (curr->vm_ops && curr->vm_ops->close)
++					err = -EINVAL;
+ 				remove = curr;
+ 			} else {			/* case 5 */
+ 				adjust = curr;
+ 				adj_start = (end - curr->vm_start);
+ 			}
++			if (!err)
++				err = dup_anon_vma(prev, curr, &anon_dup);
+ 		}
+ 	} else { /* merge_next */
+ 		vma_start_write(next);

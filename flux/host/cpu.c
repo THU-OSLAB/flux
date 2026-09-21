@@ -18,7 +18,6 @@ static int flux_init_ctrl_cpus(void)
 	int i;
 	int cpu;
 
-#if defined(CONFIG_FLUX_UINTR) || defined(CONFIG_FLUX_FNET)
 	flux_env.ctrl_cpu = -1;
 #ifdef CONFIG_FLUX_FNET
 	if (flux_env.fnet_enabled)
@@ -29,7 +28,6 @@ static int flux_init_ctrl_cpus(void)
 		FLUX_LOG(FLUX_LOG_INFO,
 			 "external flux_iokd owns timer delivery cpu\n");
 	return 0;
-#endif
 
 	max_cpus = numa_num_possible_cpus();
 	if (sched_getaffinity(0, sizeof(cpuset), &cpuset) < 0) {
@@ -126,13 +124,6 @@ int flux_init_cpus(void)
 				 "failed to auto-select local cpu list\n");
 			return ret;
 		}
-	}
-
-	if (CONFIG_FLUX_MAX_CPUS != flux_env.nr_cpus) {
-		FLUX_LOG(FLUX_LOG_WARN,
-			"configured max cpus %d != detected cpus %d\n",
-			CONFIG_FLUX_MAX_CPUS, flux_env.nr_cpus);
-		return -FLUX_EINVAL;
 	}
 
 	ret = flux_init_ctrl_cpus();

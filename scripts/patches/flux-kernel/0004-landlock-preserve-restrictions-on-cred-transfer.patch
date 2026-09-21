@@ -1,0 +1,51 @@
+From 39705a6c29f8a2b93cf5b99528a55366c50014d1 Mon Sep 17 00:00:00 2001
+From: Jann Horn <jannh@google.com>
+Date: Wed, 24 Jul 2024 14:49:01 +0200
+Subject: [PATCH] landlock: Don't lose track of restrictions on cred_transfer
+
+Backport upstream commit 39705a6c29f8a2b93cf5b99528a55366c50014d1 onto the Flux Linux 6.6 tree.
+
+Upstream reference: https://git.kernel.org/linus/39705a6c29f8
+
+---
+ kernel/security/landlock/cred.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/security/landlock/cred.c b/kernel/security/landlock/cred.c
+index 786af18..db9fe7d 100644
+--- a/kernel/security/landlock/cred.c
++++ b/kernel/security/landlock/cred.c
+@@ -14,8 +14,8 @@
+ #include "ruleset.h"
+ #include "setup.h"
+ 
+-static int hook_cred_prepare(struct cred *const new,
+-			     const struct cred *const old, const gfp_t gfp)
++static void hook_cred_transfer(struct cred *const new,
++			       const struct cred *const old)
+ {
+ 	struct landlock_ruleset *const old_dom = landlock_cred(old)->domain;
+ 
+@@ -23,6 +23,12 @@ static int hook_cred_prepare(struct cred *const new,
+ 		landlock_get_ruleset(old_dom);
+ 		landlock_cred(new)->domain = old_dom;
+ 	}
++}
++
++static int hook_cred_prepare(struct cred *const new,
++			     const struct cred *const old, const gfp_t gfp)
++{
++	hook_cred_transfer(new, old);
+ 	return 0;
+ }
+ 
+@@ -36,6 +42,7 @@ static void hook_cred_free(struct cred *const cred)
+ 
+ static struct security_hook_list landlock_hooks[] __ro_after_init = {
+ 	LSM_HOOK_INIT(cred_prepare, hook_cred_prepare),
++	LSM_HOOK_INIT(cred_transfer, hook_cred_transfer),
+ 	LSM_HOOK_INIT(cred_free, hook_cred_free),
+ };
+ 
+-- 
+2.43.0

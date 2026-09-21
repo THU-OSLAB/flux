@@ -12,10 +12,15 @@
 
 struct flux_mm_ctx;
 
-int flux_mpk_enable(struct flux_mm_ctx *ctx);
-void flux_mpk_ctx_release(struct flux_mm_ctx *ctx);
-int flux_mpk_validate_app_range(struct flux_mm_ctx *ctx, unsigned long arg);
-int flux_mpk_hook_init(void);
-void flux_mpk_hook_exit(void);
+extern bool flux_mpk_range_has_pkey(unsigned long start, unsigned long len,
+				    int pkey, unsigned long required_flags);
+
+extern int flux_mpk_enable(struct flux_mm_ctx *ctx);
+extern void flux_mpk_ctx_release(struct flux_mm_ctx *ctx);
+extern int flux_mpk_validate_app_range(struct flux_mm_ctx *ctx,
+				       unsigned long arg);
+extern int flux_uintr_signal_hook_init(void);
+extern void flux_uintr_signal_hook_exit(void);
+extern void flux_mpk_hook_exit(void);
 
 #endif /* _FLUX_KMOD_MPK_H */

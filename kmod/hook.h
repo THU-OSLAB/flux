@@ -4,6 +4,8 @@
 #include <linux/atomic.h>
 #include <linux/ftrace.h>
 
+#include "compat/symbols.h"
+
 #define FLUX_HOOK(_name, _func, _orig) \
 	{                                 \
 		.name = (_name),            \
@@ -20,6 +22,15 @@
 		.address = 0,                                      \
 		.active_calls = (_active_calls),                    \
 		.mpk_context_only = true,                          \
+	}
+
+#define FLUX_GLOBAL_TRACKED_HOOK(_name, _func, _orig, _active_calls) \
+	{                                                               \
+		.name = (_name),                                         \
+		.func = (_func),                                         \
+		.orig = (_orig),                                         \
+		.address = 0,                                            \
+		.active_calls = (_active_calls),                          \
 	}
 
 #define FLUX_SYSCALL_HOOK(_name, _func, _orig, _active_calls) \
@@ -50,10 +61,9 @@ struct flux_hook_group {
 	size_t nr_hooks;
 };
 
-int flux_hook_init(void);
-int flux_hook_group_install(struct flux_hook_group *group);
-int flux_hook_group_remove(struct flux_hook_group *group);
-bool flux_hook_group_active(struct flux_hook_group *group);
-unsigned long flux_lookup_symbol(const char *name);
+extern int flux_hook_init(void);
+extern int flux_hook_group_install(struct flux_hook_group *group);
+extern int flux_hook_group_remove(struct flux_hook_group *group);
+extern bool flux_hook_group_active(struct flux_hook_group *group);
 
 #endif /* _FLUX_KMOD_HOOK_H */

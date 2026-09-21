@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 
+struct flux_mpk_cmp64;
+
 #ifdef CONFIG_FLUX_MPK
 static inline void flux_mpk_enter_kernel(void)
 {
@@ -16,10 +18,11 @@ static inline void flux_mpk_enter_kernel(void)
 }
 
 int flux_mpk_init(void);
-int flux_mpk_disable_host_rseq(void);
-int flux_mpk_protect_app(void *addr, size_t len, int prot);
+int flux_mpk_protect_kernel(void *addr, size_t len, int prot);
 int flux_mpk_protect_shared(void *addr, size_t len, int prot);
-int flux_mpk_scan_binary(const void *addr, size_t len, size_t *offset);
+int flux_mpk_scan_exec(const void *addr, size_t len, size_t *offset);
+int flux_mpk_handle_fault(int signum, void *ucontext,
+			  struct flux_mpk_cmp64 *cmp);
 #else
 static inline void flux_mpk_enter_kernel(void)
 {
@@ -30,18 +33,19 @@ static inline int flux_mpk_init(void)
 	return 0;
 }
 
-static inline int flux_mpk_disable_host_rseq(void)
+static inline int flux_mpk_protect_kernel(void *addr, size_t len, int prot)
 {
 	return 0;
 }
 
-static inline int flux_mpk_protect_app(void *addr, size_t len, int prot)
+static inline int flux_mpk_scan_exec(const void *addr, size_t len,
+				     size_t *offset)
 {
 	return 0;
 }
 
-static inline int flux_mpk_scan_binary(const void *addr, size_t len,
-				       size_t *offset)
+static inline int flux_mpk_handle_fault(int signum, void *ucontext,
+					struct flux_mpk_cmp64 *cmp)
 {
 	return 0;
 }

@@ -37,6 +37,14 @@ static int uintr_clock_next_event(unsigned long delta,
 	return 0;
 }
 
+static int uintr_clock_shutdown(struct clock_event_device *ce)
+{
+	struct uintr_timer *timer =
+		container_of((char (*)[64])ce->name, struct uintr_timer, name);
+
+	return flux_ops_timer_set_oneshot(timer->handle, 0);
+}
+
 static void uintr_clock_broadcast(const struct cpumask *mask)
 {
 #ifdef CONFIG_SMP
@@ -55,6 +63,7 @@ static DEFINE_PER_CPU(struct clock_event_device, uintr_clock_event) = {
 	.features = CLOCK_EVT_FEAT_ONESHOT,
 	.rating = 499,
 	.set_next_event = uintr_clock_next_event,
+	.set_state_shutdown = uintr_clock_shutdown,
 	.broadcast = uintr_clock_broadcast,
 };
 
@@ -96,6 +105,15 @@ static int uintr_timer_dying_cpu(unsigned int cpu)
 static irqreturn_t uintr_timer_interrupt(int irq, void *dev_id)
 {
 	struct clock_event_device *dev = this_cpu_ptr(&uintr_clock_event);
+	struct uintr_timer *timer = this_cpu_ptr(&uintr_timer);
+
+	/*
+	 * Claim this delivery before the event handler optionally arms its next
+	 * event.  A stale retry returns zero and must not run the handler or clear
+	 * the newer deadline.  ULONG_MAX is reserved as the claim operation.
+	 */
+	if (flux_ops_timer_set_oneshot(timer->handle, ~0UL) <= 0)
+		return IRQ_HANDLED;
 
 	dev->event_handler(dev);
 

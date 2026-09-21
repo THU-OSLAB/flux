@@ -1,0 +1,18 @@
+From: Flux LTP compatibility work
+Subject: [PATCH] sched: disable MM CID allocation for Flux
+
+Flux preserves the base rseq ABI, but its library-OS task/MM lifecycle does
+not support the scheduler MM CID delayed-work optimization safely.  Keep the
+existing CPU-ID fallback for rseq mm_cid and avoid stale dynamic-percpu state.
+
+diff --git a/kernel/init/Kconfig b/kernel/init/Kconfig
+--- a/kernel/init/Kconfig
++++ b/kernel/init/Kconfig
+@@ -1016,6 +1016,6 @@ endif #CGROUP_SCHED
+ 
+ config SCHED_MM_CID
+ 	def_bool y
+-	depends on SMP && RSEQ
++	depends on SMP && RSEQ && !FLUX
+ 
+ config UCLAMP_TASK_GROUP

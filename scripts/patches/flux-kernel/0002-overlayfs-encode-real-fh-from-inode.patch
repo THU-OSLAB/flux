@@ -1,0 +1,98 @@
+From beb165b2515970b2d42a205a23505b6d51efc6e8 Mon Sep 17 00:00:00 2001
+From: Amir Goldstein <amir73il@gmail.com>
+Date: Mon, 24 Aug 2026 21:51:16 +0800
+Subject: [PATCH] overlayfs: encode real file handles from inode
+
+Backport upstream commit 07aeefae7ff44d80524375253980b1bdee2396b0 onto the Flux Linux 6.6 tree. The export.c side of this prerequisite is grouped with patch 0005 so both delivery patches remain independently applicable to a clean inner tree.
+---
+ kernel/fs/overlayfs/copy_up.c   | 11 ++++++-----
+ kernel/fs/overlayfs/namei.c     |  4 ++--
+ kernel/fs/overlayfs/overlayfs.h |  2 +-
+ 3 files changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/kernel/fs/overlayfs/copy_up.c b/kernel/fs/overlayfs/copy_up.c
+index ada3fcc..e97bcf1 100644
+--- a/kernel/fs/overlayfs/copy_up.c
++++ b/kernel/fs/overlayfs/copy_up.c
+@@ -371,13 +371,13 @@ int ovl_set_attr(struct ovl_fs *ofs, struct dentry *upperdentry,
+ 	return err;
+ }
+ 
+-struct ovl_fh *ovl_encode_real_fh(struct ovl_fs *ofs, struct dentry *real,
++struct ovl_fh *ovl_encode_real_fh(struct ovl_fs *ofs, struct inode *realinode,
+ 				  bool is_upper)
+ {
+ 	struct ovl_fh *fh;
+ 	int fh_type, dwords;
+ 	int buflen = MAX_HANDLE_SZ;
+-	uuid_t *uuid = &real->d_sb->s_uuid;
++	uuid_t *uuid = &realinode->i_sb->s_uuid;
+ 	int err;
+ 
+ 	/* Make sure the real fid stays 32bit aligned */
+@@ -394,7 +394,8 @@ struct ovl_fh *ovl_encode_real_fh(struct ovl_fs *ofs, struct dentry *real,
+ 	 * the price or reconnecting the dentry.
+ 	 */
+ 	dwords = buflen >> 2;
+-	fh_type = exportfs_encode_fh(real, (void *)fh->fb.fid, &dwords, 0);
++	fh_type = exportfs_encode_inode_fh(realinode, (void *)fh->fb.fid,
++					   &dwords, NULL, 0);
+ 	buflen = (dwords << 2);
+ 
+ 	err = -EIO;
+@@ -438,7 +439,7 @@ int ovl_set_origin(struct ovl_fs *ofs, struct dentry *lower,
+ 	 * up and a pure upper inode.
+ 	 */
+ 	if (ovl_can_decode_fh(lower->d_sb)) {
+-		fh = ovl_encode_real_fh(ofs, lower, false);
++		fh = ovl_encode_real_fh(ofs, d_inode(lower), false);
+ 		if (IS_ERR(fh))
+ 			return PTR_ERR(fh);
+ 	}
+@@ -461,7 +462,7 @@ static int ovl_set_upper_fh(struct ovl_fs *ofs, struct dentry *upper,
+ 	const struct ovl_fh *fh;
+ 	int err;
+ 
+-	fh = ovl_encode_real_fh(ofs, upper, true);
++	fh = ovl_encode_real_fh(ofs, d_inode(upper), true);
+ 	if (IS_ERR(fh))
+ 		return PTR_ERR(fh);
+ 
+diff --git a/kernel/fs/overlayfs/namei.c b/kernel/fs/overlayfs/namei.c
+index 80391c6..273a39d 100644
+--- a/kernel/fs/overlayfs/namei.c
++++ b/kernel/fs/overlayfs/namei.c
+@@ -523,7 +523,7 @@ int ovl_verify_set_fh(struct ovl_fs *ofs, struct dentry *dentry,
+ 	struct ovl_fh *fh;
+ 	int err;
+ 
+-	fh = ovl_encode_real_fh(ofs, real, is_upper);
++	fh = ovl_encode_real_fh(ofs, d_inode(real), is_upper);
+ 	err = PTR_ERR(fh);
+ 	if (IS_ERR(fh)) {
+ 		fh = NULL;
+@@ -720,7 +720,7 @@ int ovl_get_index_name(struct ovl_fs *ofs, struct dentry *origin,
+ 	struct ovl_fh *fh;
+ 	int err;
+ 
+-	fh = ovl_encode_real_fh(ofs, origin, false);
++	fh = ovl_encode_real_fh(ofs, d_inode(origin), false);
+ 	if (IS_ERR(fh))
+ 		return PTR_ERR(fh);
+ 
+diff --git a/kernel/fs/overlayfs/overlayfs.h b/kernel/fs/overlayfs/overlayfs.h
+index 9817b2d..ee34240 100644
+--- a/kernel/fs/overlayfs/overlayfs.h
++++ b/kernel/fs/overlayfs/overlayfs.h
+@@ -813,7 +813,7 @@ int ovl_copy_up_with_data(struct dentry *dentry);
+ int ovl_maybe_copy_up(struct dentry *dentry, int flags);
+ int ovl_copy_xattr(struct super_block *sb, const struct path *path, struct dentry *new);
+ int ovl_set_attr(struct ovl_fs *ofs, struct dentry *upper, struct kstat *stat);
+-struct ovl_fh *ovl_encode_real_fh(struct ovl_fs *ofs, struct dentry *real,
++struct ovl_fh *ovl_encode_real_fh(struct ovl_fs *ofs, struct inode *realinode,
+ 				  bool is_upper);
+ int ovl_set_origin(struct ovl_fs *ofs, struct dentry *lower,
+ 		   struct dentry *upper);
+-- 
+2.43.0
+

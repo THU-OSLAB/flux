@@ -6,19 +6,28 @@
 #include "spdk.h"
 
 #include <limits.h>
+#include <linux/mempolicy.h>
+#include <numaif.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/queue.h>
 
 #define FLUX_SPDK_CTRL_DEV_PATH "/dev/spdk-control"
 #define FLUX_SPDK_CTRL_SYSFS_DEV_PATH "/sys/class/misc/spdk-control/dev"
+#define FLUX_SPDK_ZERO_COPY_EAL_MB 256
+
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
+#endif
 
 static int flux_spdk_build_env_context(char *buf, size_t buflen);
 static int g_flux_spdk_host_node = SPDK_ENV_NUMA_ID_ANY;
 
 struct flux_spdk_fixed_mapping {
 	void *fixed_addr;
-	void *backing_addr;
 	size_t size;
 	STAILQ_ENTRY(flux_spdk_fixed_mapping) link;
 };
@@ -277,6 +286,7 @@ static int flux_spdk_context_init(struct flux_spdk_context *ctx)
 	opts.shm_id = 0;
 	opts.mem_channel = 1;
 	opts.opts_size = sizeof(opts);
+	opts.hugepage_single_segments = true;
 	rc = flux_spdk_get_device_numa_node(run_cfg->spdk_bdf[0], &node);
 	if (rc < 0)
 		return rc;
@@ -748,9 +758,21 @@ static int flux_spdk_get_node_hugepages_mb(int node, long *mb_out)
 	return 0;
 }
 
+static size_t flux_spdk_zero_copy_memory_size(void)
+{
+	size_t dma_size = flux_env.dma_size;
+
+	if (dma_size && dma_size < 256 * MB)
+		dma_size = 256 * MB;
+	dma_size = align_up(dma_size, 256 * MB);
+
+	return align_up((size_t)flux_env.mem_size, PGSIZE_2MB) + dma_size;
+}
+
 static int flux_spdk_build_env_context(char *buf, size_t buflen)
 {
 	long node_mb;
+	long socket_mb;
 	int node;
 	int sockets;
 	int i;
@@ -769,6 +791,22 @@ static int flux_spdk_build_env_context(char *buf, size_t buflen)
 	if (rc < 0)
 		return rc;
 
+	socket_mb = node_mb;
+	if (flux_env.spdk_zero_copy) {
+		size_t memory_mb = flux_spdk_zero_copy_memory_size() / MB;
+		size_t required_mb = memory_mb + FLUX_SPDK_ZERO_COPY_EAL_MB;
+
+		if ((size_t)node_mb < required_mb) {
+			FLUX_LOG(FLUX_LOG_ERR,
+				 "zero-copy SPDK requires %zu MB hugepages on node %d "
+				 "(%zu MB Flux + %d MB EAL), found %ld MB\n",
+				 required_mb, node, memory_mb,
+				 FLUX_SPDK_ZERO_COPY_EAL_MB, node_mb);
+			return -FLUX_ENOMEM;
+		}
+		socket_mb = FLUX_SPDK_ZERO_COPY_EAL_MB;
+	}
+
 	sockets = numa_max_node() + 1;
 	if (sockets <= 0 || node >= sockets)
 		return -FLUX_EINVAL;
@@ -778,7 +816,7 @@ static int flux_spdk_build_env_context(char *buf, size_t buflen)
 		return -FLUX_ENOMEM;
 
 	for (i = 0; i < sockets; i++) {
-		long mb = (i == node) ? node_mb : 0;
+		long mb = (i == node) ? socket_mb : 0;
 		int wrote = snprintf(buf + len, buflen - (size_t)len, "%s%ld",
 				     i == 0 ? "" : ",", mb);
 		if (wrote < 0 || (size_t)wrote >= buflen - (size_t)len)
@@ -798,71 +836,61 @@ static void *
 flux_spdk_dma_malloc_fixed(void *hint, size_t size, size_t align, int flags)
 {
 	struct flux_spdk_fixed_mapping *mapping = NULL;
-	void *backing_addr = NULL;
 	void *fixed_addr = MAP_FAILED;
-	uint64_t offset = 0;
+	struct bitmask *nodemask = NULL;
 	size_t alloc_size;
-	size_t mapped_size = 0;
-	int fd = -1;
+	int node;
 	int rc;
+	int map_flags = MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB |
+			MAP_HUGE_2MB | MAP_FIXED_NOREPLACE;
+
+	(void)flags;
 
 	alloc_size = align_up(size, PGSIZE_2MB);
 	if (align > PGSIZE_2MB)
 		alloc_size = align_up(alloc_size, align);
 
-	backing_addr = spdk_dma_zmalloc_socket(alloc_size, align, NULL,
-					       flux_spdk_host_node_get());
-	if (!backing_addr)
-		goto out;
-
-	fd = spdk_mem_get_fd_and_offset(backing_addr, &offset);
-	if (fd < 0)
-		goto out;
-
 	fixed_addr = mmap(hint, alloc_size, PROT_READ | PROT_WRITE,
-			  MAP_SHARED | MAP_FIXED_NOREPLACE, fd, (off_t)offset);
+			  map_flags, -1, 0);
 	if (fixed_addr == MAP_FAILED || fixed_addr != hint) {
-		if (fixed_addr != MAP_FAILED && fixed_addr != hint)
-			munmap(fixed_addr, alloc_size);
-		fixed_addr = hint;
-		while (mapped_size < alloc_size) {
-			void *chunk_hint = (char *)hint + mapped_size;
-			void *backing_chunk = (char *)backing_addr + mapped_size;
-			void *chunk_addr;
-			uint64_t chunk_offset = 0;
-			int chunk_fd;
-
-			chunk_fd = spdk_mem_get_fd_and_offset(backing_chunk,
-							      &chunk_offset);
-			if (chunk_fd < 0)
-				goto out;
-
-			chunk_addr = mmap(chunk_hint, PGSIZE_2MB,
-					  PROT_READ | PROT_WRITE,
-					  MAP_SHARED | MAP_FIXED_NOREPLACE,
-					  chunk_fd, (off_t)chunk_offset);
-			if (chunk_addr == MAP_FAILED || chunk_addr != chunk_hint) {
-				if (chunk_addr != MAP_FAILED &&
-				    chunk_addr != chunk_hint)
-					munmap(chunk_addr, PGSIZE_2MB);
-				goto out;
-			}
-			mapped_size += PGSIZE_2MB;
-		}
-	} else {
-		mapped_size = alloc_size;
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "zero-copy hugepage mmap failed addr=%p len=%zu: %s\n",
+			 hint, alloc_size, flux_strerror(errno));
+		goto out;
 	}
 
+	node = flux_spdk_host_node_get();
+	if (node != SPDK_ENV_NUMA_ID_ANY) {
+		nodemask = numa_allocate_nodemask();
+		if (!nodemask)
+			goto out;
+		numa_bitmask_clearall(nodemask);
+		numa_bitmask_setbit(nodemask, node);
+		if (mbind(fixed_addr, alloc_size, MPOL_BIND, nodemask->maskp,
+			  nodemask->size, 0) < 0) {
+			FLUX_LOG(FLUX_LOG_ERR,
+				 "failed to bind zero-copy memory to node %d: %s\n",
+				 node, flux_strerror(errno));
+			goto out;
+		}
+		numa_free_nodemask(nodemask);
+		nodemask = NULL;
+	}
+
+	memset(fixed_addr, 0, alloc_size);
 	rc = spdk_mem_register(fixed_addr, alloc_size);
-	if (rc)
+	if (rc) {
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "spdk_mem_register failed addr=%p len=%zu: %s\n",
+			 fixed_addr, alloc_size, flux_strerror(rc));
 		goto out;
+	}
 
 	mapping = calloc(1, sizeof(*mapping));
 	if (!mapping)
 		goto out_unregister;
 
 	mapping->fixed_addr = fixed_addr;
-	mapping->backing_addr = backing_addr;
 	mapping->size = alloc_size;
 
 	pthread_mutex_lock(&g_flux_spdk_fixed_mappings_lock);
@@ -874,10 +902,10 @@ flux_spdk_dma_malloc_fixed(void *hint, size_t size, size_t align, int flags)
 out_unregister:
 	spdk_mem_unregister(fixed_addr, alloc_size);
 out:
-	if (fixed_addr != MAP_FAILED && mapped_size)
-		munmap(fixed_addr, mapped_size);
-	if (backing_addr)
-		spdk_dma_free(backing_addr);
+	if (nodemask)
+		numa_free_nodemask(nodemask);
+	if (fixed_addr != MAP_FAILED)
+		munmap(fixed_addr, alloc_size);
 	return NULL;
 }
 
@@ -912,7 +940,6 @@ void flux_spdk_dma_free(void *addr, size_t size)
 	if (mapping) {
 		spdk_mem_unregister(mapping->fixed_addr, mapping->size);
 		munmap(mapping->fixed_addr, mapping->size);
-		spdk_dma_free(mapping->backing_addr);
 		free(mapping);
 		return;
 	}

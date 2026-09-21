@@ -24,6 +24,7 @@
 #define FLUX_RUNC_STATUS_FILE "status.json"
 #define FLUX_RUNC_OCI_CONFIG_FILE "oci-config.json"
 #define FLUX_RUNC_RUN_CONFIG_FILE "run-config.json"
+#define FLUX_RUNC_RESOURCES_FILE "resources.json"
 #define FLUX_RUNC_EXEC_SESSION_DIR "sessions"
 static void flux_runc_free_string(char **value)
 {
@@ -471,6 +472,9 @@ static int flux_runc_state_init_paths(struct flux_runc_state *state,
 	if (flux_runc_set_fmt(&state->run_config_path, "%s/%s",
 			      state->state_dir, FLUX_RUNC_RUN_CONFIG_FILE) < 0)
 		return -ENOMEM;
+	if (flux_runc_set_fmt(&state->resources_path, "%s/%s",
+			      state->state_dir, FLUX_RUNC_RESOURCES_FILE) < 0)
+		return -ENOMEM;
 
 	return 0;
 }
@@ -507,6 +511,19 @@ int flux_runc_state_exec_session_root(const struct flux_runc_state *state,
 		return -ENAMETOOLONG;
 
 	return 0;
+}
+
+int flux_runc_state_set_cgroup_path(struct flux_runc_state *state,
+				    const char *cgroup_path)
+{
+	if (!state)
+		return -EINVAL;
+	if (!cgroup_path || !cgroup_path[0]) {
+		flux_runc_free_string(&state->cgroup_path);
+		return 0;
+	}
+	return flux_runc_strdup(&state->cgroup_path, cgroup_path) < 0 ?
+		       -ENOMEM : 0;
 }
 
 static int flux_runc_json_escape(FILE *stream, const char *value)
@@ -555,7 +572,7 @@ static int flux_runc_json_escape(FILE *stream, const char *value)
 static int flux_runc_state_emit_json(const struct flux_runc_state *state,
 				     FILE *stream)
 {
-	if (fputs("{\n  \"id\": ", stream) == EOF)
+	if (fputs("{\n  \"ociVersion\": \"1.3.0\",\n  \"id\": ", stream) == EOF)
 		return -1;
 	if (flux_runc_json_escape(stream, state->id ?: "") < 0)
 		return -1;
@@ -586,6 +603,14 @@ static int flux_runc_state_emit_json(const struct flux_runc_state *state,
 		return -1;
 	if (state->exec_ring_name) {
 		if (flux_runc_json_escape(stream, state->exec_ring_name) < 0)
+			return -1;
+	} else if (fputs("null", stream) == EOF) {
+		return -1;
+	}
+	if (fputs(",\n  \"cgroupsPath\": ", stream) == EOF)
+		return -1;
+	if (state->cgroup_path) {
+		if (flux_runc_json_escape(stream, state->cgroup_path) < 0)
 			return -1;
 	} else if (fputs("null", stream) == EOF) {
 		return -1;
@@ -761,6 +786,11 @@ static int flux_runc_parse_status_json(const char *json,
 	if (ret < 0)
 		return ret;
 
+	ret = flux_runc_json_get_optional_string(json, "cgroupsPath",
+						 &state->cgroup_path);
+	if (ret < 0)
+		return ret;
+
 	ret = flux_runc_json_get_string(json, "status", &status);
 	if (ret < 0)
 		return ret;
@@ -833,8 +863,10 @@ void flux_runc_state_fini(struct flux_runc_state *state)
 	flux_runc_free_string(&state->state_dir);
 	flux_runc_free_string(&state->oci_config_path);
 	flux_runc_free_string(&state->run_config_path);
+	flux_runc_free_string(&state->resources_path);
 	flux_runc_free_string(&state->pid_file_path);
 	flux_runc_free_string(&state->exec_ring_name);
+	flux_runc_free_string(&state->cgroup_path);
 	flux_runc_state_reset(state);
 }
 
@@ -984,6 +1016,8 @@ int flux_runc_state_snapshot_run_config(const struct flux_runc_state *state,
 
 int flux_runc_state_cleanup_artifacts(const struct flux_runc_state *state)
 {
+	int ret;
+
 	if (!state)
 		return 0;
 
@@ -994,6 +1028,10 @@ int flux_runc_state_cleanup_artifacts(const struct flux_runc_state *state)
 	if (state->exec_ring_name && state->exec_ring_name[0] &&
 	    shm_unlink(state->exec_ring_name) < 0 && errno != ENOENT)
 		return -errno;
+
+	ret = flux_runc_cgroup_destroy(state);
+	if (ret < 0)
+		return ret;
 
 	return 0;
 }

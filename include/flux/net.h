@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 /*
- * Network configuration helpers for guest-facing interfaces.
+ * Network configuration helpers for application-facing interfaces.
  *
  * The plain gateway helpers update the default routing table. Interfaces that
  * take an ifindex operate on per-interface policy-routing tables derived from

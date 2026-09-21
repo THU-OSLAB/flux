@@ -116,11 +116,7 @@ void __init time_init(void)
 		return;
 	}
 
-#ifdef CONFIG_FLUX_UINTR
 	uintr_timer_init();
-#else
-	default_timer_init();
-#endif
 
 	return;
 }

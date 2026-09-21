@@ -10,11 +10,13 @@
 #include <linux/errno.h>
 
 struct task_struct;
+int ptrace_request(struct task_struct *child, long request,
+		   unsigned long addr, unsigned long data);
 
 static inline long arch_ptrace(struct task_struct *child, long request,
 			       unsigned long addr, unsigned long data)
 {
-	return -EINVAL;
+	return ptrace_request(child, request, addr, data);
 }
 
 static inline void ptrace_disable(struct task_struct *child)

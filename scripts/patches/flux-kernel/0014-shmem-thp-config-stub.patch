@@ -1,0 +1,42 @@
+From: Flux MMU configuration work
+Subject: [PATCH] shmem: inline the disabled THP predicate in its header
+
+Expose the existing false stub to callers when THP is disabled, so both
+getattr and allocation can discard THP-only constants and helpers without
+relying on interprocedural optimization of an external function.
+
+--- a/kernel/include/linux/shmem_fs.h
++++ b/kernel/include/linux/shmem_fs.h
+@@ -110,8 +110,17 @@
+ extern void shmem_truncate_range(struct inode *inode, loff_t start, loff_t end);
+ int shmem_unuse(unsigned int type);
+ 
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ extern bool shmem_is_huge(struct inode *inode, pgoff_t index, bool shmem_huge_force,
+ 			  struct mm_struct *mm, unsigned long vm_flags);
++#else
++static inline bool shmem_is_huge(struct inode *inode, pgoff_t index,
++				 bool shmem_huge_force, struct mm_struct *mm,
++				 unsigned long vm_flags)
++{
++	return false;
++}
++#endif
+ #ifdef CONFIG_SHMEM
+ extern unsigned long shmem_swap_usage(struct vm_area_struct *vma);
+ #else
+--- a/kernel/mm/shmem.c
++++ b/kernel/mm/shmem.c
+@@ -741,12 +741,6 @@
+ #else /* !CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+ #define shmem_huge SHMEM_HUGE_DENY
+-
+-bool shmem_is_huge(struct inode *inode, pgoff_t index, bool shmem_huge_force,
+-		   struct mm_struct *mm, unsigned long vm_flags)
+-{
+-	return false;
+-}
+ 
+ static unsigned long shmem_unused_huge_shrink(struct shmem_sb_info *sbinfo,
+ 		struct shrink_control *sc, unsigned long nr_to_split)

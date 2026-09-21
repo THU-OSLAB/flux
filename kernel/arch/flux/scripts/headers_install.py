@@ -148,6 +148,7 @@ class Installer:
     def install_headers(self):
         self.find_headers("arch/flux/include/uapi/asm/syscalls.h")
         self.headers.add("arch/flux/include/uapi/asm/mpk.h")
+        self.headers.add("arch/flux/include/uapi/asm/rewrite.h")
         self.headers.add("arch/flux/include/uapi/asm/host_ops.h")
         self.headers.add("arch/flux/include/uapi/asm/flux_ops.h")
         self.headers.add("arch/flux/include/uapi/asm/flux_oci.h")
@@ -156,6 +157,7 @@ class Installer:
         self.find_headers("include/uapi/linux/android/binder.h")
         self.find_headers("include/uapi/linux/uhid.h")
         self.find_headers("include/uapi/linux/mman.h")
+        self.find_headers("include/uapi/linux/landlock.h")
         self.find_headers("include/uapi/linux/input-event-codes.h")
 
         if 'FLUX_INSTALL_ADDITIONAL_HEADERS' in os.environ:

@@ -11,7 +11,17 @@ enum flux_signal_ctrl_op {
 	FLUX_SIGNAL_CTRL_NONE = 0,
 	FLUX_SIGNAL_CTRL_KILL = 1,
 	FLUX_SIGNAL_CTRL_EXEC = 2,
+	FLUX_SIGNAL_CTRL_RESOURCE = 3,
 };
+
+/*
+ * Host-side runc/exec control uses a queued signal as a doorbell into Flux.
+ * Keep it away from SIGUSR1/SIGUSR2: applications and tests legitimately use
+ * those signals heavily, and mixing them with the control plane corrupts Flux
+ * siginfo/targeting semantics under signal-flooding workloads.
+ */
+#define FLUX_SIGNAL_CTRL_DOORBELL 64
+#define FLUX_SIGNAL_CTRL_DOORBELL_STR "64"
 
 #define FLUX_SIGNAL_CTRL_OP_MASK 0xffu
 #define FLUX_SIGNAL_CTRL_SIGNO_SHIFT 8
@@ -82,14 +92,77 @@ struct flux_exec_ring_hdr {
 	uint32_t head;
 	uint32_t tail;
 	uint32_t size;
-	uint32_t reserved;
+	int32_t init_status;
 	uint64_t next_seq;
+};
+
+enum flux_resource_op {
+	FLUX_RESOURCE_OP_NONE = 0,
+	FLUX_RESOURCE_OP_UPDATE = 1,
+	FLUX_RESOURCE_OP_STATS = 2,
+};
+
+enum flux_resource_limit_flag {
+	FLUX_RESOURCE_F_MEMORY_MAX = 1ULL << 0,
+	FLUX_RESOURCE_F_MEMORY_LOW = 1ULL << 1,
+	FLUX_RESOURCE_F_MEMORY_SWAP_MAX = 1ULL << 2,
+	FLUX_RESOURCE_F_CPU_WEIGHT = 1ULL << 3,
+	FLUX_RESOURCE_F_CPU_MAX = 1ULL << 4,
+	FLUX_RESOURCE_F_CPU_BURST = 1ULL << 5,
+	FLUX_RESOURCE_F_CPU_IDLE = 1ULL << 6,
+	FLUX_RESOURCE_F_PIDS_MAX = 1ULL << 7,
+};
+
+struct flux_resource_limits {
+	uint64_t flags;
+	int64_t memory_max;
+	int64_t memory_low;
+	int64_t memory_swap_max;
+	uint64_t cpu_weight;
+	int64_t cpu_quota;
+	uint64_t cpu_period;
+	uint64_t cpu_burst;
+	int64_t cpu_idle;
+	int64_t pids_max;
+};
+
+struct flux_resource_stats {
+	uint64_t memory_current;
+	uint64_t memory_max;
+	uint64_t memory_events_low;
+	uint64_t memory_events_high;
+	uint64_t memory_events_max;
+	uint64_t memory_events_oom;
+	uint64_t memory_events_oom_kill;
+	uint64_t cpu_usage_usec;
+	uint64_t cpu_user_usec;
+	uint64_t cpu_system_usec;
+	uint64_t cpu_nr_periods;
+	uint64_t cpu_nr_throttled;
+	uint64_t cpu_throttled_usec;
+	uint64_t pids_current;
+	uint64_t pids_max;
+	uint64_t pids_events_max;
+	uint64_t io_read_bytes;
+	uint64_t io_write_bytes;
+	uint64_t io_read_ops;
+	uint64_t io_write_ops;
+};
+
+struct flux_resource_ctrl {
+	uint64_t request_seq;
+	uint64_t response_seq;
+	uint32_t op;
+	int32_t status;
+	struct flux_resource_limits limits;
+	struct flux_resource_stats stats;
 };
 
 /*
  * A producer fills one slot, transitions it from FREE to READY, and then
- * raises SIGUSR1(op=EXEC, arg=...). The consumer transitions READY to RUNNING
- * and finally to DONE or ERROR after the request has completed.
+ * raises FLUX_SIGNAL_CTRL_DOORBELL with an EXEC payload. The consumer
+ * transitions READY to RUNNING and finally to DONE or ERROR after the request
+ * has completed.
  */
 struct flux_exec_slot {
 	uint32_t state;
@@ -111,8 +184,46 @@ struct flux_exec_slot {
 
 struct flux_exec_ring {
 	struct flux_exec_ring_hdr hdr;
+	struct flux_resource_ctrl resource;
 	struct flux_exec_slot slots[FLUX_EXEC_RING_SLOTS];
 };
+
+static inline int32_t
+flux_exec_ring_init_status_load(const struct flux_exec_ring *ring)
+{
+	return !ring ? -1 :
+		       __atomic_load_n(&ring->hdr.init_status, __ATOMIC_ACQUIRE);
+}
+
+static inline uint64_t
+flux_resource_request_seq_load(const struct flux_resource_ctrl *resource)
+{
+	return !resource ? 0 :
+		       __atomic_load_n(&resource->request_seq, __ATOMIC_ACQUIRE);
+}
+
+static inline uint64_t
+flux_resource_response_seq_load(const struct flux_resource_ctrl *resource)
+{
+	return !resource ? 0 :
+		       __atomic_load_n(&resource->response_seq, __ATOMIC_ACQUIRE);
+}
+
+static inline void
+flux_resource_request_seq_store(struct flux_resource_ctrl *resource,
+				uint64_t seq)
+{
+	if (resource)
+		__atomic_store_n(&resource->request_seq, seq, __ATOMIC_RELEASE);
+}
+
+static inline void
+flux_resource_response_seq_store(struct flux_resource_ctrl *resource,
+				 uint64_t seq)
+{
+	if (resource)
+		__atomic_store_n(&resource->response_seq, seq, __ATOMIC_RELEASE);
+}
 
 static inline uint32_t flux_exec_slot_state_load(const struct flux_exec_slot *slot)
 {

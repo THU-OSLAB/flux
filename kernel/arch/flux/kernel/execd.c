@@ -1,6 +1,7 @@
 #define pr_fmt(fmt) "execd: " fmt
 
 #include <linux/fs_struct.h>
+#include <linux/binfmts.h>
 #include <linux/mm.h>
 #include <linux/namei.h>
 #include <linux/sched.h>
@@ -8,8 +9,10 @@
 #include <linux/sched/idle.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/syscalls.h>
+#include <linux/uaccess.h>
 
 #include <asm/signal.h>
 #include <asm/console.h>
@@ -22,7 +25,7 @@
 #include <uapi/asm/mman.h>
 #include <uapi/asm/flux_oci.h>
 
-#if defined(CONFIG_FLUX_UINTR) && defined(CONFIG_FLUX_RUNC)
+#ifdef CONFIG_FLUX_RUNC
 
 static inline int flux_wait_wifexited(int stat)
 {
@@ -64,11 +67,279 @@ struct flux_exec_dispatch_req {
 	uint32_t slot_idx;
 };
 
-static void flux_exec_post_exec(void *entry, unsigned long stack);
-
 static struct flux_exec_ring *flux_exec_ring(void)
 {
 	return (struct flux_exec_ring *)(unsigned long)FLUX_EXEC_RING_MAP_ADDR;
+}
+
+#define FLUX_RESOURCE_CGROUP "/sys/fs/cgroup/flux-oci"
+
+static int flux_resource_path(char *buf, size_t size, const char *name)
+{
+	int len = snprintf(buf, size, "%s/%s", FLUX_RESOURCE_CGROUP, name);
+
+	return len < 0 || len >= size ? -ENAMETOOLONG : 0;
+}
+
+static int flux_resource_write(const char *name, const char *value)
+{
+	struct file *file;
+	char path[128];
+	loff_t pos = 0;
+	ssize_t len = strlen(value);
+	ssize_t nw;
+	int ret;
+
+	ret = flux_resource_path(path, sizeof(path), name);
+	if (ret < 0)
+		return ret;
+	file = filp_open(path, O_WRONLY, 0);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+	nw = kernel_write(file, value, len, &pos);
+	filp_close(file, NULL);
+	return nw == len ? 0 : nw < 0 ? (int)nw : -EIO;
+}
+
+static int flux_resource_read(const char *name, char *buf, size_t size)
+{
+	struct file *file;
+	char path[128];
+	loff_t pos = 0;
+	ssize_t nr;
+	int ret;
+
+	if (size < 2)
+		return -EINVAL;
+	ret = flux_resource_path(path, sizeof(path), name);
+	if (ret < 0)
+		return ret;
+	file = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+	nr = kernel_read(file, buf, size - 1, &pos);
+	filp_close(file, NULL);
+	if (nr < 0)
+		return (int)nr;
+	buf[nr] = '\0';
+	return 0;
+}
+
+static int flux_resource_write_i64(const char *name, s64 value,
+				   bool max_for_negative)
+{
+	char buf[64];
+
+	if (value < 0 && max_for_negative)
+		snprintf(buf, sizeof(buf), "max\n");
+	else
+		snprintf(buf, sizeof(buf), "%lld\n", (long long)value);
+	return flux_resource_write(name, buf);
+}
+
+static int flux_resource_write_u64(const char *name, u64 value)
+{
+	char buf[64];
+
+	snprintf(buf, sizeof(buf), "%llu\n", (unsigned long long)value);
+	return flux_resource_write(name, buf);
+}
+
+static u64 flux_resource_parse_u64(const char *value)
+{
+	unsigned long long result = 0;
+
+	while (*value == ' ' || *value == '\t')
+		value++;
+	if (!strncmp(value, "max", 3))
+		return U64_MAX;
+	if (kstrtoull(value, 10, &result) < 0)
+		return 0;
+	return (u64)result;
+}
+
+static u64 flux_resource_stat_value(const char *buf, const char *key)
+{
+	const char *line = buf;
+	size_t key_len = strlen(key);
+
+	while (line && *line) {
+		const char *next = strchr(line, '\n');
+		if (!strncmp(line, key, key_len) &&
+		    (line[key_len] == ' ' || line[key_len] == '='))
+			return flux_resource_parse_u64(line + key_len + 1);
+		line = next ? next + 1 : NULL;
+	}
+	return 0;
+}
+
+static int flux_resource_apply_limits(
+	const struct flux_resource_limits *limits)
+{
+	char buf[128];
+	int ret;
+
+#define APPLY_I64(flag, name, field, max_negative)                            \
+	do {                                                                   \
+		if (limits->flags & (flag)) {                                    \
+			ret = flux_resource_write_i64(name, limits->field,          \
+						      max_negative);                  \
+			if (ret < 0)                                               \
+				return ret;                                           \
+		}                                                              \
+	} while (0)
+#define APPLY_U64(flag, name, field)                                          \
+	do {                                                                   \
+		if (limits->flags & (flag)) {                                    \
+			ret = flux_resource_write_u64(name, limits->field);         \
+			if (ret < 0)                                               \
+				return ret;                                           \
+		}                                                              \
+	} while (0)
+	APPLY_I64(FLUX_RESOURCE_F_MEMORY_MAX, "memory.max", memory_max, true);
+	APPLY_I64(FLUX_RESOURCE_F_MEMORY_LOW, "memory.low", memory_low, false);
+	APPLY_I64(FLUX_RESOURCE_F_MEMORY_SWAP_MAX, "memory.swap.max",
+		  memory_swap_max, true);
+	APPLY_U64(FLUX_RESOURCE_F_CPU_WEIGHT, "cpu.weight", cpu_weight);
+	if (limits->flags & FLUX_RESOURCE_F_CPU_MAX) {
+		if (limits->cpu_quota < 0)
+			snprintf(buf, sizeof(buf), "max %llu\n",
+				 (unsigned long long)limits->cpu_period);
+		else
+			snprintf(buf, sizeof(buf), "%lld %llu\n",
+				 (long long)limits->cpu_quota,
+				 (unsigned long long)limits->cpu_period);
+		ret = flux_resource_write("cpu.max", buf);
+		if (ret < 0)
+			return ret;
+	}
+	APPLY_U64(FLUX_RESOURCE_F_CPU_BURST, "cpu.max.burst", cpu_burst);
+	APPLY_I64(FLUX_RESOURCE_F_CPU_IDLE, "cpu.idle", cpu_idle, false);
+	APPLY_I64(FLUX_RESOURCE_F_PIDS_MAX, "pids.max", pids_max, true);
+#undef APPLY_I64
+#undef APPLY_U64
+	return 0;
+}
+
+static void flux_resource_io_stats(const char *buf,
+				   struct flux_resource_stats *stats)
+{
+	const char *line = buf;
+
+	while (line && *line) {
+		const char *next = strchr(line, '\n');
+		struct {
+			const char *key;
+			u64 *value;
+		} fields[] = {
+			{ "rbytes=", &stats->io_read_bytes },
+			{ "wbytes=", &stats->io_write_bytes },
+			{ "rios=", &stats->io_read_ops },
+			{ "wios=", &stats->io_write_ops },
+		};
+
+		for (size_t i = 0; i < ARRAY_SIZE(fields); i++) {
+			const char *pos = strnstr(line, fields[i].key,
+						  next ? next - line : strlen(line));
+			if (pos)
+				*fields[i].value += flux_resource_parse_u64(
+					pos + strlen(fields[i].key));
+		}
+		line = next ? next + 1 : NULL;
+	}
+}
+
+static int flux_resource_collect_stats(struct flux_resource_stats *stats)
+{
+	char *buf;
+	int ret = 0;
+
+	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	memset(stats, 0, sizeof(*stats));
+#define READ_SINGLE(name, field)                                              \
+	do {                                                                   \
+		ret = flux_resource_read(name, buf, PAGE_SIZE);                  \
+		if (ret < 0)                                                   \
+			goto out;                                            \
+		stats->field = flux_resource_parse_u64(buf);                    \
+	} while (0)
+	READ_SINGLE("memory.current", memory_current);
+	READ_SINGLE("memory.max", memory_max);
+	READ_SINGLE("pids.current", pids_current);
+	READ_SINGLE("pids.max", pids_max);
+#undef READ_SINGLE
+	ret = flux_resource_read("memory.events", buf, PAGE_SIZE);
+	if (ret == 0) {
+		stats->memory_events_low = flux_resource_stat_value(buf, "low");
+		stats->memory_events_high = flux_resource_stat_value(buf, "high");
+		stats->memory_events_max = flux_resource_stat_value(buf, "max");
+		stats->memory_events_oom = flux_resource_stat_value(buf, "oom");
+		stats->memory_events_oom_kill =
+			flux_resource_stat_value(buf, "oom_kill");
+	}
+	ret = flux_resource_read("cpu.stat", buf, PAGE_SIZE);
+	if (ret == 0) {
+		stats->cpu_usage_usec = flux_resource_stat_value(buf, "usage_usec");
+		stats->cpu_user_usec = flux_resource_stat_value(buf, "user_usec");
+		stats->cpu_system_usec =
+			flux_resource_stat_value(buf, "system_usec");
+		stats->cpu_nr_periods = flux_resource_stat_value(buf, "nr_periods");
+		stats->cpu_nr_throttled =
+			flux_resource_stat_value(buf, "nr_throttled");
+		stats->cpu_throttled_usec =
+			flux_resource_stat_value(buf, "throttled_usec");
+	}
+	ret = flux_resource_read("pids.events", buf, PAGE_SIZE);
+	if (ret == 0)
+		stats->pids_events_max = flux_resource_stat_value(buf, "max");
+	ret = flux_resource_read("io.stat", buf, PAGE_SIZE);
+	if (ret == 0)
+		flux_resource_io_stats(buf, stats);
+	ret = 0;
+out:
+	kfree(buf);
+	return ret;
+}
+
+static void flux_resource_dispatch(struct flux_exec_ring *ring)
+{
+	struct flux_resource_ctrl *resource;
+	u64 request_seq;
+	int status;
+
+	if (!ring)
+		return;
+	resource = &ring->resource;
+	request_seq = flux_resource_request_seq_load(resource);
+	if (!request_seq ||
+	    request_seq == flux_resource_response_seq_load(resource))
+		return;
+
+	switch (READ_ONCE(resource->op)) {
+	case FLUX_RESOURCE_OP_UPDATE:
+		status = flux_resource_apply_limits(&resource->limits);
+		break;
+	case FLUX_RESOURCE_OP_STATS:
+		status = flux_resource_collect_stats(&resource->stats);
+		break;
+	default:
+		status = -EINVAL;
+		break;
+	}
+	WRITE_ONCE(resource->status, status);
+	flux_resource_response_seq_store(resource, request_seq);
+}
+
+void flux_exec_record_init_status(int status)
+{
+	struct flux_exec_ring *ring = flux_exec_ring();
+
+	/* Direct Flux launches do not map an exec ring.  put_user keeps that
+	 * optional case fault-safe; OCI launches publish the raw wait status to
+	 * the host runtime through their existing shared ring. */
+	(void)put_user(status, &ring->hdr.init_status);
 }
 
 static void flux_exec_child_req_free(struct flux_exec_child_req *req)
@@ -196,35 +467,12 @@ err:
 
 static int flux_exec_apply_child_overrides(struct flux_exec_child_req *req)
 {
-	const struct flux_cons *cons;
-	void *old_journal_info;
 	int ret;
 
-	cons = flux_cons_lookup(req->session_id);
-	if (!cons)
-		return -EINVAL;
-
-	switch (cons->kind) {
-	case FLUX_CONS_KIND_NONE:
-		break;
-	case FLUX_CONS_KIND_STDIO:
-		ret = flux_cons_install_stdio(cons);
-		if (ret < 0) {
-			pr_err("failed to install stdio session %u: %d\n",
-			       req->session_id, ret);
-			goto out;
-		}
-		break;
-	case FLUX_CONS_KIND_TTY:
-		ret = flux_cons_install_tty(cons);
-		if (ret < 0) {
-			pr_err("failed to install tty session %u: %d\n",
-			       req->session_id, ret);
-			goto out;
-		}
-		break;
-	default:
-		ret = -EINVAL;
+	ret = flux_cons_install_session(req->session_id);
+	if (ret < 0) {
+		pr_err("failed to install console session %u: %d\n",
+		       req->session_id, ret);
 		goto out;
 	}
 
@@ -247,24 +495,12 @@ static int flux_exec_apply_child_overrides(struct flux_exec_child_req *req)
 			goto out;
 	}
 
-	old_journal_info = current->journal_info;
-	current->journal_info = req;
-	ret = flux_do_host_exec_with_post(req->filename, req->argv, req->envp,
-					  flux_exec_post_exec);
-	current->journal_info = old_journal_info;
+	ret = kernel_execve(req->filename, (const char *const *)req->argv,
+			    (const char *const *)req->envp);
 	if (ret < 0)
-		pr_err("host exec failed for %s: %d\n", req->filename, ret);
+		pr_err("exec failed for %s: %d\n", req->filename, ret);
 out:
 	return ret;
-}
-
-static void flux_exec_post_exec(void *entry, unsigned long stack)
-{
-	struct flux_exec_child_req *req = current->journal_info;
-
-	current->journal_info = NULL;
-	flux_exec_child_req_free(req);
-	flux_post_exec_to_user(entry, stack);
 }
 
 static int flux_exec_child_trampoline(void *arg)
@@ -294,7 +530,12 @@ static int flux_exec_status_from_wait(int stat)
 static pid_t flux_exec_fork_child(struct flux_exec_child_req *req)
 {
 	struct kernel_clone_args args = {
-		.flags = CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID,
+		/* The OCI exec worker must not depend on Flux fork-MM cloning.
+		 * vfork keeps the dedicated worker asleep until execve installs the
+		 * new image (or the child exits), while avoiding an unnecessary
+		 * duplicate of the running container address space. */
+		.flags = CLONE_VM | CLONE_VFORK | CLONE_CHILD_CLEARTID |
+			 CLONE_CHILD_SETTID,
 		.exit_signal = SIGCHLD,
 		.fn = flux_exec_child_trampoline,
 		.fn_arg = req,
@@ -423,6 +664,7 @@ static int flux_execd_main(void *unused)
 					 atomic_read(&flux_exec_pending));
 		if (!atomic_xchg(&flux_exec_pending, 0))
 			continue;
+		flux_resource_dispatch(ring);
 		flux_exec_dispatch_ready_slots(ring);
 	}
 
@@ -449,4 +691,4 @@ void flux_exec_wake(void)
 	wake_up_interruptible(&flux_exec_waitq);
 }
 
-#endif /* CONFIG_FLUX_UINTR && CONFIG_FLUX_RUNC */
+#endif /* CONFIG_FLUX_RUNC */

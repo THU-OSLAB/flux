@@ -17,7 +17,7 @@
  */
 
 #define FLUX_IOK_CTRL_MAGIC 0x66696f6bU
-#define FLUX_IOK_CTRL_VERSION 4U
+#define FLUX_IOK_CTRL_VERSION 8U
 
 #define FLUX_IOKD_NAME_PREFIX "flux_iokd"
 #define FLUX_IOK_SOCK_PATH_BASE "/tmp/flux.sock"
@@ -107,6 +107,19 @@ enum flux_iok_ctrl_op {
 	FLUX_IOK_CTRL_REGISTER = 3,
 	FLUX_IOK_CTRL_DMA_MAP = 4,
 	FLUX_IOK_CTRL_DMA_UNMAP = 5,
+	FLUX_IOK_CTRL_MLX5_PREPARE = 6,
+	FLUX_IOK_CTRL_MLX5_READY = 7,
+	FLUX_IOK_CTRL_MLX5_ACTIVE = 8,
+	FLUX_IOK_CTRL_MLX5_QUIESCE = 9,
+	FLUX_IOK_CTRL_MLX5_DMA_MAP_DONE = 10,
+	FLUX_IOK_CTRL_RESOURCE_UPDATE = 11,
+	FLUX_IOK_CTRL_RESOURCE_STATS = 12,
+	FLUX_IOK_CTRL_RESOURCE_REPLY = 13,
+};
+
+enum flux_iok_net_backend {
+	FLUX_IOK_NET_BACKEND_LRPC = 1,
+	FLUX_IOK_NET_BACKEND_MLX5_EXTERNAL = 2,
 };
 
 struct flux_iok_ctrl_hdr {
@@ -122,7 +135,17 @@ struct flux_iok_ctrl_attach {
 	uint32_t ip_addr;
 	uint32_t netmask;
 	uint32_t gateway;
+	uint32_t flags;
+	uint32_t io_weight;
+	uint32_t net_class_id;
+	uint32_t net_priority;
+	uint32_t cpu_shares;
+	int64_t cpu_quota;
+	uint64_t cpu_period;
+	int32_t cpu_list[CONFIG_FLUX_MAX_CPUS];
 };
+
+#define FLUX_IOK_ATTACH_F_CPU_LIST (1U << 0)
 
 struct flux_iok_ctrl_ack {
 	struct flux_iok_ctrl_hdr hdr;
@@ -134,8 +157,9 @@ struct flux_iok_ctrl_ack {
 	uint64_t window_base;
 	uint64_t rx_len;
 	uint64_t rx_pgsize;
+	uint32_t backend;
 	uint8_t host_mac[6];
-	uint8_t reserved[10];
+	uint8_t reserved[6];
 	int cpu_list[CONFIG_FLUX_MAX_CPUS];
 };
 
@@ -154,6 +178,36 @@ struct flux_iok_ctrl_register {
 	struct flux_fnet_qspec txcmdqs[CONFIG_FLUX_MAX_CPUS];
 };
 
+struct flux_iok_ctrl_resource_request {
+	struct flux_iok_ctrl_hdr hdr;
+	int32_t peer_pid;
+	uint32_t io_weight;
+	uint32_t net_class_id;
+	uint32_t net_priority;
+	uint32_t cpu_shares;
+	uint32_t reserved;
+	int64_t cpu_quota;
+	uint64_t cpu_period;
+};
+
+struct flux_iok_ctrl_resource_reply {
+	struct flux_iok_ctrl_hdr hdr;
+	int32_t status;
+	int32_t client_id;
+	uint32_t io_weight;
+	uint32_t net_class_id;
+	uint32_t net_priority;
+	uint32_t cpu_shares;
+	uint32_t nr_cpus;
+	int64_t cpu_quota;
+	uint64_t cpu_period;
+	uint64_t rx_packets;
+	uint64_t rx_bytes;
+	uint64_t tx_packets;
+	uint64_t tx_bytes;
+	int32_t cpu_list[CONFIG_FLUX_MAX_CPUS];
+};
+
 struct flux_iok_ctrl_dma_map {
 	struct flux_iok_ctrl_hdr hdr;
 	uint64_t addr;
@@ -161,13 +215,56 @@ struct flux_iok_ctrl_dma_map {
 	uint64_t pgsize;
 };
 
+struct flux_iok_ctrl_mlx5_prepare {
+	struct flux_iok_ctrl_hdr hdr;
+	uint64_t spec_len;
+	uint64_t dma_hca_va;
+	uint64_t dma_len;
+};
+
+struct flux_iok_ctrl_mlx5_ready {
+	struct flux_iok_ctrl_hdr hdr;
+	uint32_t generation;
+	uint32_t nr_queues;
+	uint64_t ready_queues;
+};
+
+struct flux_iok_ctrl_mlx5_dma_map_done {
+	struct flux_iok_ctrl_hdr hdr;
+	uint64_t hca_va;
+	uint64_t len;
+};
+
 struct flux_iok_rx_slot {
 	struct flux_iok_mbuf mbuf;
 	unsigned char data[FLUX_IOK_RX_SLOT_DATA_LEN];
 };
 
+#define FLUX_IOK_TIMER_DELIVERY_PENDING (1ULL << 63)
+
 struct flux_iok_timer_entry {
 	uint64_t deadline_ns;
 } __attribute__((__aligned__(64)));
+
+_Static_assert(sizeof(struct flux_iok_ctrl_hdr) == 16,
+	       "flux iok control header ABI changed");
+_Static_assert(sizeof(int) == 4, "flux iok CPU list requires 32-bit int");
+_Static_assert(offsetof(struct flux_iok_ctrl_attach, cpu_list) == 72,
+	       "flux iok attach ABI changed");
+_Static_assert(sizeof(struct flux_iok_ctrl_resource_request) == 56,
+	       "flux iok resource request ABI changed");
+_Static_assert(offsetof(struct flux_iok_ctrl_resource_reply, cpu_list) == 96,
+	       "flux iok resource reply ABI changed");
+_Static_assert(offsetof(struct flux_iok_ctrl_ack, cpu_list) == 80,
+	       "flux iok ACK ABI changed");
+_Static_assert(sizeof(struct flux_iok_ctrl_ack) ==
+		       ((80 + sizeof(int) * CONFIG_FLUX_MAX_CPUS + 7) & ~7),
+	       "flux iok ACK size changed");
+_Static_assert(sizeof(struct flux_iok_ctrl_mlx5_prepare) == 40,
+	       "flux iok mlx5 prepare ABI changed");
+_Static_assert(sizeof(struct flux_iok_ctrl_mlx5_ready) == 32,
+	       "flux iok mlx5 ready ABI changed");
+_Static_assert(sizeof(struct flux_iok_ctrl_mlx5_dma_map_done) == 32,
+	       "flux iok mlx5 DMA done ABI changed");
 
 #endif /* _FLUX_LIB_IO_IOK_EXT_H */

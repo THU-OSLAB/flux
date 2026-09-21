@@ -1,0 +1,84 @@
+From: Flux architecture integration
+Subject: [PATCH] mm: prepare architecture projections before fault/populate
+
+Linux retains VMA, file, accounting and rollback semantics. Optional hooks
+prepare address-space projection before mmap callbacks/population and allow
+architecture fault prerequisites after publishing the VMA.
+
+--- a/kernel/mm/mmap.c
++++ b/kernel/mm/mmap.c
+@@ -2693,6 +2693,12 @@
+ 	if (do_vmi_munmap(&vmi, mm, addr, len, uf, false))
+ 		return -ENOMEM;
+ 
++#ifdef arch_prepare_mmap
++	error = arch_prepare_mmap(addr, len, vm_flags);
++	if (error)
++		return error;
++#endif
++
+ 	/*
+ 	 * Private writable mapping: check memory availability
+ 	 */
+@@ -2886,6 +2892,9 @@
+ 	vm_flags_set(vma, VM_SOFTDIRTY);
+ 
+ 	vma_set_page_prot(vma);
++#ifdef arch_complete_mmap
++	arch_complete_mmap(vma);
++#endif
+ 
+ 	validate_mm(mm);
+ 	return addr;
+@@ -3085,6 +3094,10 @@
+ 
+ 	if (security_vm_enough_memory_mm(mm, len >> PAGE_SHIFT))
+ 		return -ENOMEM;
++#ifdef arch_prepare_mmap
++	if (arch_prepare_mmap(addr, len, flags))
++		goto unacct_fail;
++#endif
+ 
+ 	/*
+ 	 * Expand the existing vma if possible; Note that singular lists do not
+@@ -3138,6 +3151,9 @@
+ 	if (flags & VM_LOCKED)
+ 		mm->locked_vm += (len >> PAGE_SHIFT);
+ 	vm_flags_set(vma, VM_SOFTDIRTY);
++#ifdef arch_complete_mmap
++	arch_complete_mmap(vma);
++#endif
+ 	return 0;
+ 
+ mas_store_fail:
+
+--- a/kernel/mm/mremap.c
++++ b/kernel/mm/mremap.c
+@@ -630,6 +630,12 @@
+ 	if (err)
+ 		return err;
+ 
++#ifdef arch_prepare_mmap
++	err = arch_prepare_mmap(new_addr, new_len, vm_flags);
++	if (err)
++		return err;
++#endif
++
+ 	if (vm_flags & VM_ACCOUNT) {
+ 		if (security_vm_enough_memory_mm(mm, to_account >> PAGE_SHIFT))
+ 			return -ENOMEM;
+@@ -1037,6 +1043,14 @@
+ 			pgoff_t extension_pgoff = vma->vm_pgoff +
+ 				((extension_start - vma->vm_start) >> PAGE_SHIFT);
+ 			VMA_ITERATOR(vmi, mm, extension_start);
++
++#ifdef arch_prepare_mmap
++			ret = arch_prepare_mmap(extension_start,
++					       extension_end - extension_start,
++					       vma->vm_flags);
++			if (ret)
++				goto out;
++#endif
+ 
+ 			if (vma->vm_flags & VM_ACCOUNT) {
+ 				if (security_vm_enough_memory_mm(mm, pages)) {

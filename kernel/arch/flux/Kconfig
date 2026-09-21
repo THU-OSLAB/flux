@@ -1,41 +1,111 @@
 # SPDX-License-Identifier: GPL-2.0
 config FLUX
 	def_bool y
-	depends on !COREDUMP && !SECCOMP && !UPROBES && !COMPAT && !USER_RETURN_NOTIFIER
+	depends on !COMPAT && !USER_RETURN_NOTIFIER
 	select ARCH_SUPPORTS_ATOMIC_RMW
+	select ARCH_SUPPORTS_PER_VMA_LOCK if FLUX_LINUX66_COMPAT
 	select ARCH_USE_QUEUED_RWLOCKS
 	select ARCH_USE_QUEUED_SPINLOCKS
 	select ARCH_WANTS_NO_INSTR
+	select ARCH_WANT_DEFAULT_TOPDOWN_MMAP_LAYOUT if MMU
 	select ARCH_WANT_FRAME_POINTERS
+	select ARCH_WANT_IRQS_OFF_ACTIVATE_MM
 	select BUG
 	select DEVTMPFS
 	select FLAT_NODE_MEM_MAP
 	select LOCK_MM_AND_FIND_VMA 	if MMU
+	select MODULES_USE_ELF_RELA if MODULES
 	select GENERIC_CLOCKEVENTS
 	select GENERIC_CLOCKEVENTS_BROADCAST
 	select GENERIC_CPU_DEVICES 		if !SMP
-	select GENERIC_GETTIMEOFDAY
 	select GENERIC_ENTRY
 	select GENERIC_IRQ_SHOW
 	select GENERIC_PENDING_IRQ		if SMP
 	select GENERIC_SMP_IDLE_THREAD
 	select GENERIC_STRNCPY_FROM_USER
 	select GENERIC_STRNLEN_USER
-	select GENERIC_TIME_VSYSCALL
+	select GENERIC_GETTIMEOFDAY
 	select HAS_DMA
-	select HAVE_GENERIC_VDSO
 	select HAVE_ARCH_KASAN
+	select HAVE_ARCH_MMAP_RND_BITS	if MMU
+	select HAVE_ARCH_SECCOMP_FILTER if FLUX_LINUX66_COMPAT
 	select HAVE_MEMBLOCK
 	select HAVE_REGS_AND_STACK_ACCESS_API
+	select HAVE_PERF_EVENTS if FLUX_LINUX66_COMPAT
+	select HAVE_ARCH_TRANSPARENT_HUGEPAGE if MMU
+	select HAVE_GENERIC_VDSO
+	select GENERIC_VDSO_TIME_NS if FLUX_LINUX66_COMPAT
+	select GENERIC_TIME_VSYSCALL
 	select HAVE_RSEQ
+	select HAVE_ARCH_USERFAULTFD_WP if USERFAULTFD
+	select HAVE_ARCH_USERFAULTFD_MINOR if USERFAULTFD
 	select HAVE_SETUP_PER_CPU_AREA
+	select HAVE_UID16 if FLUX_LINUX66_COMPAT
 	select HIGH_RES_TIMERS
 	select MMU_GATHER_MERGE_VMAS 	if MMU
+	select ARCH_SUPPORTS_HUGETLBFS	if MMU
+	select ARCH_WANT_GENERAL_HUGETLB	if MMU
+	select ARCH_SUPPORTS_MEMORY_FAILURE if MMU
 	select NEED_PER_CPU_EMBED_FIRST_CHUNK
 	select THREAD_INFO_IN_TASK
 	select TRACING
 
+config ARCH_HAS_PROC_MAPS
+	def_bool y
+
 menu "Flux configuration"
+
+config FLUX_STATIC_HUGETLB_SHARE
+	bool "Use shared hugetlb PMDs for static Flux memory"
+	depends on !NUMA && !FLUX_MPK && !FLUX_FNET && !FLUX_SPDK
+	default n
+	help
+	  Experimental native host hugetlb page-table sharing. Static memory
+	  (DMA plus normal memory minus the elastic pool) must be a multiple
+	  of 1 GiB. Requires a preallocated host 2 MiB hugepage pool. Allocation
+	  failure aborts boot; there is no silent base-page fallback. Elastic
+	  memory retains its separate reclaimable base-page backing.
+
+config FLUX_HOST_FAULT_REPAIR
+	bool "Resolve fork-child read faults in the host with fault-around"
+	default n
+	help
+	  Bind the software page-table root and readable private-anonymous VMA
+	  ranges while constructing a fork child. A compatible host module can
+	  resolve read faults and project a bounded batch of neighboring pages
+	  without SIGSEGV or per-page ioctl round trips. Invalidation retires
+	  affected ranges before guest page/table reuse. Writes, executable or
+	  shared mappings, and failed registration retain the normal fault path.
+	  The module must enable fork_fault_repair separately.
+
+config FLUX_FAULT_STATS
+	bool "Collect Flux fault bridge diagnostics"
+	depends on PROC_FS
+	default n
+	help
+	  Expose cumulative fault-entry, alias-repair attempt and MM-resolution
+	  counters in /proc/flux_fault_stats. Counting is disabled at boot and
+	  can be enabled by an administrator with "enable 1". This diagnostic
+	  option adds overhead when enabled; leave it off for timing runs.
+
+config FLUX_FORK_STATS
+	bool "Collect Flux fork phase elapsed-time diagnostics"
+	depends on PROC_FS
+	default n
+	help
+	  Expose cumulative count and nanoseconds per fork phase through
+	  /proc/flux_fork_stats. Disabled at boot; an administrator can enable
+	  observations with "enable 1". These are inclusive elapsed times,
+	  not exclusive CPU costs. Build without this option for a baseline.
+
+config FLUX_LINUX66_COMPAT
+	bool "Enable the Linux 6.6 compatibility profile"
+	default n
+	help
+	  Enable the architecture capabilities used by the dedicated
+	  linux66_compat_defconfig. Leave this disabled for the original Flux
+	  configuration so compatibility-only selections do not change its
+	  established behavior.
 
 config 64BIT
 	bool "64-bit kernel"
@@ -45,10 +115,17 @@ config X86_64
 	def_bool y
 	depends on 64BIT
 
+config X86_UMIP
+	bool "Expose host x86 UMIP capability"
+	depends on X86_64 && FLUX_LINUX66_COMPAT
+	help
+	  Flux user instructions execute on the x86 host. Enable this only when
+	  the host kernel enforces User-Mode Instruction Prevention so userspace
+	  and capability probes observe the effective execution environment.
+
 config FLUX_UINTR
+	def_bool y
 	depends on X86_64
-	bool "Flux uintr support"
-	default n
 
 config FLUX_MPK
 	bool "Isolate the Flux kernel from applications with MPK"
@@ -57,7 +134,9 @@ config FLUX_MPK
 	help
 	  Put the Flux kernel and host runtime in a protection-key domain and
 	  switch PKRU at the Flux syscall gates. The loader rejects application
-	  code containing WRPKRU or XRSTOR and the host module enforces W^X.
+	  code containing WRPKRU or XRSTOR and the host module enforces W^X. This
+	  option is independent of the Linux 6.6 compatibility profile. Enable it
+	  only with a host module and runtime built for MPK isolation.
 
 config OUTPUT_FORMAT
        string "Output format"
@@ -74,9 +153,19 @@ config PHYS_ADDR_T_64BIT
 	def_bool 64BIT
 
 config MMU
-	bool "Flux MMU implementation"
-	depends on 64BIT
-	default n
+	def_bool 64BIT
+
+config ARCH_MMAP_RND_BITS_MIN
+	depends on MMU
+	default 22
+
+config ARCH_MMAP_RND_BITS_MAX
+	depends on MMU
+	default 22
+
+config ARCH_MMAP_RND_BITS_DEFAULT
+	depends on MMU
+	default 22
 
 config PGTABLE_LEVELS
 	int
@@ -84,7 +173,7 @@ config PGTABLE_LEVELS
 	default 4
 
 config COREDUMP
-	def_bool n
+	def_bool FLUX_LINUX66_COMPAT
 
 config BIG_ENDIAN
 	def_bool n
@@ -111,7 +200,6 @@ config CONSOLE_LOGLEVEL_QUIET
 
 config PCI
 	bool "PCI support"
-	select NO_GENERIC_PCI_IOPORT_MAP
 	select GENERIC_PCI_IOMAP
 	default n
 
@@ -156,11 +244,17 @@ config SMP
 	bool
 	default FLUX_SMP
 
-if SMP
 config FLUX_MAX_CPUS
 	int "Maximum number of CPUs supported by Flux"
+	range 1 64 if SMP
+	range 1 1 if !SMP
 	default 1
+	help
+	  The shared MPK return area provides 64 independent slots for each
+	  return class. Keep this limit synchronized with
+	  FLUX_MPK_RETURN_SLOT_CAPACITY.
 
+if SMP
 config NR_CPUS
 	int
 	default FLUX_MAX_CPUS
@@ -223,6 +317,18 @@ config NODES_SHIFT
 	help
 	  This option specifies the maximum number of NUMA nodes
 	  supported by the kernel.
+
+config FLUX_NUMA_EMULATION
+	bool "Expose a two-node virtual NUMA topology"
+	depends on NUMA && FLUX_LINUX66_COMPAT
+	default n
+	help
+	  Split the Flux memory map into two virtual NUMA nodes when no
+	  explicit numa= topology was supplied and the boot command line contains
+	  flux_numa_emulation=on. Linux's generic memory-policy implementation
+	  remains authoritative; this option does not fabricate syscall return
+	  values. Leave the boot option unset when host-backed NUMA locality is
+	  required.
 
 if X86_64
 
@@ -310,7 +416,8 @@ config FLUX_FNET_RX_SCHED_IDLE
 	help
 	  Run the per-CPU FNet receive threads using the SCHED_IDLE policy.
 	  Disable this option to retain the default SCHED_NORMAL policy when
-	  measuring the idle-thread scheduling optimization independently.
+	  measuring the idle-thread scheduling optimization independently. This
+	  changes scheduling priority only; receive processing is unchanged.
 
 config FLUX_FAST_NET
 	bool "Fast network layer (replace default socket)"
@@ -349,19 +456,6 @@ config GENERIC_CALIBRATE_DELAY
 	depends on X86_TSC
 	def_bool y
 
-choice
-	prompt "IPI implementation"
-	depends on X86_64 && FLUX_UINTR
-	default FLUX_IPI_GATE
-
-	config FLUX_IPI_GATE
-		bool "IPI gate on atomic operations"
-	
-	config FLUX_IPI_UINTR
-		bool "Multiples UINTR vectors"
-
-endchoice
-
 config FLUX_CONSOLE_READ_PATH
 	bool "Enable flux_console read path"
 	default y
@@ -371,6 +465,33 @@ config FLUX_CONSOLE_READ_PATH
 
 	  If this option is disabled then flux_console still supports the
 	  printk and TTY write paths, but no console read path is compiled in.
+
+config FLUX_ELASTIC_MEMORY
+	bool "Experimental extent-backed movable page pool"
+	depends on PROC_FS && !NUMA && !FLUX_MPK && !DEBUG_PAGEALLOC && !KASAN
+	depends on !PAGE_POISONING
+	default n
+	help
+	  Reserve a separate bitmap-allocated pool at boot. Capacity changes
+	  revoke and release whole empty host extents without memory hotplug.
+	  Order-0 movable allocations opt in through /proc/flux_elastic.
+	  This experimental pool has separate accounting from buddy memory.
+
+config FLUX_ELASTIC_MIGRATION
+	bool "Evacuate live elastic pages and enable pressure control"
+	depends on FLUX_ELASTIC_MEMORY && MIGRATION
+	default n
+	help
+	  Add explicit live-page draining and an opt-in host-pressure policy.
+	  Only ordinary order-0 LRU pages can migrate; unsupported or pinned
+	  pages leave the extent resident and return busy. Destinations use the
+	  normal buddy allocator, outside the elastic pool. DMA remains static.
+
+config FLUX_ELASTIC_POOL_MB
+	int "Elastic pool capacity in MiB (multiple of 2)"
+	depends on FLUX_ELASTIC_MEMORY
+	range 2 512
+	default 32
 
 menu "Flux Debug Options"
 	depends on DEBUG_KERNEL

@@ -213,10 +213,11 @@ int main(int argc, char **argv)
 		 flux_iokd_cfg.nic_pci_addr ? flux_iokd_cfg.nic_pci_addr :
 					      "(none)",
 		 flux_iokd_cfg.mtu, flux_iokd.tx_chksum_offload,
-		 flux_iokd_cfg.no_network ? "none" :
-		 flux_iokd.fnet_is_tap	  ? "tap" :
-		 flux_iokd.fnet_has_port  ? "dpdk" :
-					    "unknown");
+		 flux_iokd_cfg.no_network    ? "none" :
+		 flux_iokd_cfg.mlx5_external ? "mlx5-external" :
+		 flux_iokd.fnet_is_tap	     ? "tap" :
+		 flux_iokd.fnet_has_port     ? "dpdk" :
+					       "unknown");
 
 	for (;;) {
 		bool work_done = false;
@@ -227,12 +228,16 @@ int main(int argc, char **argv)
 		}
 
 #ifdef CONFIG_FLUX_FNET
-		work_done |= flux_iokd_rx_burst();
-		work_done |= flux_iokd_drain_completions();
-		work_done |= flux_iokd_tx_burst();
-		work_done |= flux_iokd_commands_rx();
+		if (!flux_iokd_cfg.mlx5_external) {
+			work_done |= flux_iokd_rx_burst();
+			work_done |= flux_iokd_drain_completions();
+			work_done |= flux_iokd_tx_burst();
+			work_done |= flux_iokd_commands_rx();
+		}
 #endif
 		work_done |= flux_iokd_timers_run();
+		if (flux_iokd_cfg.mlx5_external)
+			flux_iokd_reap_retired();
 
 		if (!work_done)
 			_mm_pause();

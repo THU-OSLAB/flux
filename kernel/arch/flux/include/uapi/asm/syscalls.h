@@ -38,6 +38,7 @@ typedef __s64 s64;
 #include <linux/times.h>
 #include <linux/timex.h>
 #include <linux/capability.h>
+#include <linux/landlock.h>
 #define __KERNEL__ /* to pull in S_ definitions */
 #include <linux/stat.h>
 #undef __KERNEL__
@@ -81,6 +82,7 @@ struct sockaddr {
 struct __aio_sigset;
 struct cachestat;
 struct cachestat_range;
+struct file_handle;
 
 #define __UAPI_DEF_IF_NET_DEVICE_FLAGS_LOWER_UP_DORMANT_ECHO 1
 #define __UAPI_DEF_IF_IFNAMSIZ 1
@@ -109,7 +111,6 @@ struct cachestat_range;
 #include <linux/fib_rules.h>
 
 #include <linux/kdev_t.h>
-#include <asm/irq.h>
 #include <linux/virtio_blk.h>
 #include <linux/virtio_net.h>
 #include <linux/virtio_ring.h>

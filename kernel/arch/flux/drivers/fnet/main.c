@@ -12,7 +12,7 @@
 #include <linux/timer.h>
 #include <linux/sched/clock.h>
 #include <uapi/linux/sched/types.h>
-#include <asm/host_ops.h>
+#include <uapi/asm/host_ops.h>
 #include <asm/softirq_stack.h>
 
 #include "core.h"
@@ -25,6 +25,7 @@ static DEFINE_IDR(fnet_index_idr);
 static DEFINE_MUTEX(fnet_mutex);
 
 struct fnet_netdev *fnet_dev = NULL;
+struct fnet_backend_ops fnet_ops;
 DEFINE_PER_CPU_ALIGNED(struct fnet_cpu, fnet_cpus) = { 0 };
 
 #ifdef CONFIG_STAT_FNET
@@ -75,10 +76,17 @@ static int fnet_close(struct net_device *dev)
 	return 0;
 }
 
-static u16 skb_ip_proto(struct sk_buff *skb)
+static bool fnet_skb_ip_proto(const struct sk_buff *skb, u8 *protocol)
 {
-	return (ip_hdr(skb)->version == 4) ? ip_hdr(skb)->protocol :
-					     ipv6_hdr(skb)->nexthdr;
+	if (skb->protocol == htons(ETH_P_IP)) {
+		*protocol = ip_hdr(skb)->protocol;
+		return true;
+	}
+	if (skb->protocol == htons(ETH_P_IPV6)) {
+		*protocol = ipv6_hdr(skb)->nexthdr;
+		return true;
+	}
+	return false;
 }
 
 static void fnet_release_copied_skb_mbuf(struct mbuf *m)
@@ -89,27 +97,28 @@ static void fnet_release_copied_skb_mbuf(struct mbuf *m)
 	dev_kfree_skb_any(skb);
 }
 
-static bool fnet_xmit_skb(struct fnet_cpu *cpu, struct sk_buff *skb)
+static bool fnet_lrpc_xmit_skb(struct fnet_cpu *cpu, struct sk_buff *skb)
 {
-	union flux_txpktq_cmd cmd;
+	union flux_txpktq_cmd cmd = {};
 	struct mbuf *m;
 	unsigned char *dst;
 	uint64_t payload;
 
-	cmd.dst_ip = ip_hdr(skb)->daddr;
+	if (skb->protocol == htons(ETH_P_IP))
+		cmd.dst_ip = ip_hdr(skb)->daddr;
 	cmd.len = skb->len;
 	cmd.txcmd = FLUX_TXPKT_NET_XMIT;
-	cmd.olflags = 0;
 
 	if (skb->ip_summed == CHECKSUM_PARTIAL) {
-		unsigned int protocol = skb_ip_proto(skb);
+		u8 protocol;
 
-		if (ip_hdr(skb)->version == 4)
+		if (skb->protocol == htons(ETH_P_IP))
 			cmd.olflags |= FLUX_OLFLAG_IPV4 | FLUX_OLFLAG_IP_CHKSUM;
-		else
+		else if (skb->protocol == htons(ETH_P_IPV6))
 			cmd.olflags |= FLUX_OLFLAG_IPV6;
 
-		if (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP)
+		if (fnet_skb_ip_proto(skb, &protocol) &&
+		    (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP))
 			cmd.olflags |= FLUX_OLFLAG_L3_CHKSUM;
 	}
 
@@ -136,7 +145,7 @@ static bool fnet_xmit_skb(struct fnet_cpu *cpu, struct sk_buff *skb)
 	payload = flux_txpkt_payload_from_ptr((uint64_t)m, FLUX_MEMORY_ADDR,
 					      (uint16_t)skb->hash);
 
-	if (likely(lrpc_send(&cpu->txpktq, cmd.lrpc_cmd, payload)))
+	if (likely(lrpc_send(&cpu->lrpc.txpktq, cmd.lrpc_cmd, payload)))
 		return true;
 
 	m->timestamp = 0;
@@ -145,12 +154,27 @@ static bool fnet_xmit_skb(struct fnet_cpu *cpu, struct sk_buff *skb)
 	return false;
 }
 
+static bool fnet_lrpc_xmit_mbuf(struct fnet_cpu *cpu, struct mbuf *m)
+{
+	union flux_txpktq_cmd cmd;
+	uint64_t payload;
+
+	cmd.dst_ip = m->tx_dst_ip;
+	cmd.len = mbuf_length(m);
+	cmd.txcmd = FLUX_TXPKT_NET_XMIT;
+	cmd.olflags = m->txflags;
+	payload = flux_txpkt_payload_from_ptr((uint64_t)m, FLUX_MEMORY_ADDR,
+					      (uint16_t)m->hash);
+
+	return lrpc_send(&cpu->lrpc.txpktq, cmd.lrpc_cmd, payload);
+}
+
 static bool fnet_xmit_drain_ofq(struct fnet_cpu *cpu)
 {
 	struct sk_buff *skb;
 
 	while ((skb = skb_peek(&cpu->txofq_skb)) != NULL) {
-		if (unlikely(!fnet_xmit_skb(cpu, skb)))
+		if (unlikely(!fnet_ops.xmit_skb(cpu, skb)))
 			return false;
 		skb_dequeue(&cpu->txofq_skb);
 	}
@@ -159,6 +183,8 @@ static bool fnet_xmit_drain_ofq(struct fnet_cpu *cpu)
 
 static bool fnet_prepare_tx_skb(struct sk_buff *skb)
 {
+	u8 protocol;
+
 	if (unlikely(skb->data_len != 0 || skb_shinfo(skb)->nr_frags != 0)) {
 		pr_warn("tx: fragmented skb not supported\n");
 		return false;
@@ -173,8 +199,8 @@ static bool fnet_prepare_tx_skb(struct sk_buff *skb)
 	if (skb->ip_summed != CHECKSUM_PARTIAL)
 		return true;
 
-	if (skb_ip_proto(skb) == IPPROTO_TCP ||
-	    skb_ip_proto(skb) == IPPROTO_UDP)
+	if (fnet_skb_ip_proto(skb, &protocol) &&
+	    (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP))
 		return true;
 
 	return skb_checksum_help(skb) == 0;
@@ -202,7 +228,7 @@ static netdev_tx_t fnet_start_xmit(struct sk_buff *skb, struct net_device *dev)
 		}
 	}
 
-	if (unlikely(!fnet_xmit_skb(cpu, skb)))
+	if (unlikely(!fnet_ops.xmit_skb(cpu, skb)))
 		skb_queue_tail(&cpu->txofq_skb, skb);
 
 out:
@@ -227,7 +253,7 @@ static inline void fnet_send_comp(struct fnet_cpu *cpu, unsigned long offset)
 {
 	union flux_txcmdq_cmd cmd = { .txcmd = FLUX_TXCMD_NET_COMP };
 
-	if (!lrpc_send(&cpu->txcmdq, cmd.lrpc_cmd, offset))
+	if (!lrpc_send(&cpu->lrpc.txcmdq, cmd.lrpc_cmd, offset))
 		pr_warn("fnet_send_comp: lrpc_send failed\n");
 }
 
@@ -263,14 +289,14 @@ out:
 	return skb;
 }
 
-static int fnet_rx_poll(struct fnet_cpu *cpu, int budget)
+static int fnet_lrpc_rx_poll(struct fnet_cpu *cpu, int budget)
 {
 	union flux_rxq_cmd cmd;
 	unsigned long payload;
 	int i = 0;
 
 	while (!budget || i < budget) {
-		if (!lrpc_recv(&cpu->rxq, &cmd.lrpc_cmd, &payload))
+		if (!lrpc_recv(&cpu->lrpc.rxq, &cmd.lrpc_cmd, &payload))
 			break;
 
 		switch (cmd.rxcmd) {
@@ -332,7 +358,7 @@ void flux_fast_net_poll(void)
 	migrate_disable();
 	cpu = this_cpu_ptr(&fnet_cpus);
 	if (likely(READ_ONCE(cpu->init))) {
-		while (fnet_rx_poll(cpu, 0))
+		while (fnet_ops.rx_poll(cpu, 0))
 			;
 	}
 	migrate_enable();
@@ -349,7 +375,7 @@ static int fnet_rx_thread(void *data)
 #endif
 
 	while (!kthread_should_stop()) {
-		while (fnet_rx_poll(cpu, 0))
+		while (fnet_ops.rx_poll(cpu, 0))
 			;
 		schedule();
 	}
@@ -357,14 +383,111 @@ static int fnet_rx_thread(void *data)
 	return 0;
 }
 
-static int fnet_start_queues(struct fnet_netdev *fnet,
-			     struct flux_fnet_netdev *arg)
+static int fnet_lrpc_start(struct fnet_netdev *fnet,
+			   const struct flux_fnet_netdev *arg)
 {
-	int err, i;
+	int i;
 	struct fnet_cpu *cpu;
 
+	for (i = 0; i < NR_CPUS; i++) {
+		cpu = fnet->cpus[i];
+		lrpc_init_in(&cpu->lrpc.rxq,
+			     (struct lrpc_msg *)arg->rxqs[i].tbl,
+			     arg->rxqs[i].size, arg->rxqs[i].wb);
+
+		lrpc_init_out(&cpu->lrpc.txpktq,
+			      (struct lrpc_msg *)arg->txpktqs[i].tbl,
+			      arg->txpktqs[i].size, arg->txpktqs[i].wb);
+		lrpc_init_out(&cpu->lrpc.txcmdq,
+			      (struct lrpc_msg *)arg->txcmdqs[i].tbl,
+			      arg->txcmdqs[i].size, arg->txcmdqs[i].wb);
+	}
+	return 0;
+}
+
+static void fnet_lrpc_quiesce(struct fnet_netdev *fnet)
+{
+}
+
+static int fnet_lrpc_stop(struct fnet_netdev *fnet)
+{
+	return 0;
+}
+
+const struct fnet_backend_ops fnet_lrpc_ops = {
+	.start = fnet_lrpc_start,
+	.deactivate = fnet_lrpc_quiesce,
+	.quiesce = fnet_lrpc_quiesce,
+	.stop = fnet_lrpc_stop,
+	.rx_poll = fnet_lrpc_rx_poll,
+	.xmit_skb = fnet_lrpc_xmit_skb,
+	.xmit_mbuf = fnet_lrpc_xmit_mbuf,
+};
+
+static void fnet_release_cpus(struct fnet_netdev *fnet)
+{
+	struct fnet_cpu *cpu;
+	int i;
+
+	for (i = 0; i < NR_CPUS; i++) {
+		cpu = fnet->cpus[i];
+		if (!cpu)
+			continue;
+		skb_queue_purge(&cpu->txofq_skb);
+		mbufq_release(&cpu->txofq_mbuf);
+		cpu->thread = NULL;
+		cpu->init = false;
+		cpu->fnet = NULL;
+		fnet->cpus[i] = NULL;
+	}
+}
+
+static void fnet_stop_threads(struct fnet_netdev *fnet)
+{
+	struct fnet_cpu *cpu;
+	int i;
+
+	for (i = 0; i < NR_CPUS; i++) {
+		cpu = fnet->cpus[i];
+		if (cpu)
+			WRITE_ONCE(cpu->init, false);
+	}
+	for (i = 0; i < NR_CPUS; i++) {
+		cpu = fnet->cpus[i];
+		if (!cpu || !cpu->thread)
+			continue;
+		kthread_stop(cpu->thread);
+		cpu->thread = NULL;
+	}
+}
+
+static void fnet_quiesce_netdev(struct fnet_netdev *fnet)
+{
+	if (!fnet || READ_ONCE(fnet->quiesced))
+		return;
+
+	netif_carrier_off(fnet->dev);
+	netif_tx_disable(fnet->dev);
+	fnet_ops.deactivate(fnet);
+	fnet_stop_threads(fnet);
+	/*
+	 * FastNet syscalls can still hold a per-CPU backend queue after
+	 * migrate_disable(). Wait until every pre-existing task-side user has
+	 * left before the backend drains and frees queue-private state.
+	 */
+	synchronize_rcu_tasks();
+	fnet_ops.quiesce(fnet);
+	WRITE_ONCE(fnet->quiesced, true);
+}
+
+static int fnet_start_queues(struct fnet_netdev *fnet,
+			     const struct flux_fnet_netdev *arg)
+{
+	struct fnet_cpu *cpu;
+	int err, i;
+
 	if (arg->nb_rx_queues != NR_CPUS || arg->nb_tx_queues != NR_CPUS) {
-		pr_err("fnet mode requires nb_rx_queues and nb_tx_queues to be %d\n",
+		pr_err("fnet mode requires one RX and TX queue per CPU (%d)\n",
 		       NR_CPUS);
 		return -EINVAL;
 	}
@@ -372,18 +495,18 @@ static int fnet_start_queues(struct fnet_netdev *fnet,
 	for (i = 0; i < NR_CPUS; i++) {
 		cpu = fnet->cpus[i] = &per_cpu(fnet_cpus, i);
 		cpu->fnet = fnet;
+		cpu->thread = NULL;
+		cpu->init = false;
 		skb_queue_head_init(&cpu->txofq_skb);
 		mbufq_init(&cpu->txofq_mbuf);
+	}
 
-		lrpc_init_in(&cpu->rxq, (struct lrpc_msg *)arg->rxqs[i].tbl,
-			     arg->rxqs[i].size, arg->rxqs[i].wb);
+	err = fnet_ops.start(fnet, arg);
+	if (err)
+		goto out_release_cpus;
 
-		lrpc_init_out(&cpu->txpktq,
-			      (struct lrpc_msg *)arg->txpktqs[i].tbl,
-			      arg->txpktqs[i].size, arg->txpktqs[i].wb);
-		lrpc_init_out(&cpu->txcmdq,
-			      (struct lrpc_msg *)arg->txcmdqs[i].tbl,
-			      arg->txcmdqs[i].size, arg->txcmdqs[i].wb);
+	for (i = 0; i < NR_CPUS; i++) {
+		cpu = fnet->cpus[i];
 
 		cpu->thread = kthread_run_on_cpu(fnet_rx_thread, cpu, i,
 						 "fnet-rx/%d");
@@ -398,15 +521,13 @@ static int fnet_start_queues(struct fnet_netdev *fnet,
 	return 0;
 
 out_free_cpus:
-	for (i = 0; i < NR_CPUS; i++) {
-		cpu = fnet->cpus[i];
-		if (!cpu)
-			continue;
-		if (cpu->thread)
-			kthread_stop(cpu->thread);
-		cpu->thread = NULL;
-		cpu->init = false;
-	}
+	fnet_ops.deactivate(fnet);
+	fnet_stop_threads(fnet);
+	synchronize_rcu_tasks();
+	fnet_ops.quiesce(fnet);
+	WARN_ON_ONCE(fnet_ops.stop(fnet));
+out_release_cpus:
+	fnet_release_cpus(fnet);
 	return err;
 }
 
@@ -414,12 +535,25 @@ static int fnet_create_netdev(struct flux_fnet_netdev *arg)
 {
 	struct net_device *netdev;
 	struct fnet_netdev *fnet;
+	const struct fnet_backend_ops *ops;
 	int err;
 	int idx;
 	netdev_features_t features;
 
-	if (arg->mode != FLUX_FNET_MODE_KERNEL) {
-		pr_err("driver only supports IOK mode\n");
+	if (fnet_dev) {
+		pr_err("only one fnet netdev is supported\n");
+		return -EBUSY;
+	}
+
+	switch (arg->mode) {
+	case FLUX_FNET_MODE_KERNEL:
+		ops = &fnet_lrpc_ops;
+		break;
+	case FLUX_FNET_MODE_MLX5_EXTERNAL:
+		ops = &fnet_mlx5_ops;
+		break;
+	default:
+		pr_err("unsupported backend mode %u\n", arg->mode);
 		return -EINVAL;
 	}
 
@@ -464,6 +598,7 @@ static int fnet_create_netdev(struct flux_fnet_netdev *arg)
 	/* we don't use pfifo_fast! */
 	netdev->priv_flags |= IFF_NO_QUEUE;
 
+	fnet_ops = *ops;
 	err = register_netdev(netdev);
 	if (err)
 		goto out_free_idr;
@@ -504,37 +639,44 @@ out_free_idr:
 	idr_remove(&fnet_index_idr, idx);
 out_free_netdev:
 	free_netdev(netdev);
+	memset(&fnet_ops, 0, sizeof(fnet_ops));
 	return err;
 }
 
-void fnet_destroy_netdev(struct fnet_netdev *fnet)
+int fnet_destroy_netdev(struct fnet_netdev *fnet)
 {
-	struct fnet_cpu *cpu;
-	int i;
+	int err;
 
 	pr_info("removing netdev %s\n", fnet->dev->name);
 
+	fnet_quiesce_netdev(fnet);
+	err = fnet_ops.stop(fnet);
+	if (err)
+		return err;
+	fnet_release_cpus(fnet);
 	unregister_netdev(fnet->dev);
-
-	for (i = 0; i < NR_CPUS; i++) {
-		cpu = fnet->cpus[i];
-		if (!cpu || !cpu->thread)
-			continue;
-		kthread_stop(cpu->thread);
-		cpu->thread = NULL;
-		cpu->init = false;
-	}
 
 	if (fnet_dev == fnet)
 		fnet_dev = NULL;
 	idr_remove(&fnet_index_idr, fnet->id);
 	free_netdev(fnet->dev);
+	memset(&fnet_ops, 0, sizeof(fnet_ops));
+	return 0;
+}
+
+void fnet_shutdown(void)
+{
+	struct fnet_netdev *fnet = READ_ONCE(fnet_dev);
+
+	if (fnet)
+		fnet_quiesce_netdev(fnet);
 }
 
 static long fnet_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	long ret = -ENOSYS;
 	struct flux_fnet_netdev netdev_arg;
+	struct fnet_netdev *fnet;
 
 	switch (cmd) {
 	case FLUX_FNET_IOCTL_ADD:
@@ -544,6 +686,17 @@ static long fnet_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			ret = -EFAULT;
 		else
 			ret = fnet_create_netdev(&netdev_arg);
+		mutex_unlock(&fnet_mutex);
+		break;
+	case FLUX_FNET_IOCTL_DEL:
+		mutex_lock(&fnet_mutex);
+		fnet = fnet_dev;
+		if (!fnet)
+			ret = -ENODEV;
+		else if (fnet->dev->ifindex != (int)arg)
+			ret = -EINVAL;
+		else
+			ret = fnet_destroy_netdev(fnet);
 		mutex_unlock(&fnet_mutex);
 		break;
 	default:
@@ -604,7 +757,7 @@ static int __init fnet_init(void)
 
 	err = misc_register(&fnet_misc);
 	if (err < 0)
-		goto out;
+		return err;
 
 #ifdef CONFIG_STAT_FNET
 	timer_setup(&stat_timer, fnet_stat_timer, 0);
@@ -612,13 +765,18 @@ static int __init fnet_init(void)
 #endif
 
 	pr_info("module loaded minor %d\n", fnet_misc.minor);
-
-out:
 	return 0;
 }
 
 static void fnet_exit(void)
 {
+#ifdef CONFIG_STAT_FNET
+	del_timer_sync(&stat_timer);
+#endif
+	mutex_lock(&fnet_mutex);
+	if (fnet_dev)
+		WARN_ON_ONCE(fnet_destroy_netdev(fnet_dev));
+	mutex_unlock(&fnet_mutex);
 	misc_deregister(&fnet_misc);
 }
 

@@ -306,7 +306,8 @@ bool flux_launch_should_bootstrap_multiproc(int argc, char **argv)
 		}
 	}
 
-	return false;
+	/* Every LibOS process uses an independent host execution mm. */
+	return true;
 }
 
 int flux_launch_bootstrap_multiproc(char *argv[])

@@ -44,9 +44,6 @@ int flux_iokd_kmod_init_sender(void)
 {
 	int fd;
 
-#ifndef CONFIG_FLUX_UINTR
-	return 0;
-#endif
 
 	if (flux_iokd_uintr_fd >= 0)
 		return 0;
@@ -73,14 +70,12 @@ int flux_iokd_kmod_init_sender(void)
 
 void flux_iokd_kmod_fini_sender(void)
 {
-#ifdef CONFIG_FLUX_UINTR
 	if (flux_iokd_uintr_fd >= 0) {
 		FLUX_LOG(FLUX_LOG_INFO, "closing %s sender state fd=%d\n",
 			 FLUX_UINTR_DEV_PATH, flux_iokd_uintr_fd);
 		close(flux_iokd_uintr_fd);
 		flux_iokd_uintr_fd = -1;
 	}
-#endif
 }
 
 void flux_iokd_kmod_unmap_shm(void)

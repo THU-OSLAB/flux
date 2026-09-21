@@ -20,7 +20,7 @@ Usage:
   scripts/flux-runtime.sh flux-runc [--run-cfg FILE] [--iokd-cfg FILE] [--no-start] [args...]
 
 Commands:
-  build         Run the required build with UINTR=1 FNET=1 FAST_NET=1.
+  build         Run the required UINTR build with FNET=1 FAST_NET=1.
   resolve-sock  Print the socket path this user-scoped run should target.
   check-iokd    Exit 0 only if a healthy flux-iokd is serving that exact socket.
   ensure-iokd   Start flux-iokd for that socket if needed, then verify it.
@@ -387,7 +387,7 @@ run_build() {
 	printf 'flux-runtime: building with %s job(s)\n' "$jobs" >&2
 	(
 		cd "$ROOT_DIR"
-		UINTR=1 FNET=1 FAST_NET=1 make -j"$jobs"
+		FNET=1 FAST_NET=1 make -j"$jobs"
 	)
 }
 

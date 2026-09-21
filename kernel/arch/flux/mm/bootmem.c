@@ -7,6 +7,12 @@
 #include <asm/host_ops.h>
 #include <asm/spdk.h>
 #include <asm/numa.h>
+#ifdef CONFIG_FLUX_STATIC_HUGETLB_SHARE
+#include <asm/host_dev.h>
+#endif
+#ifdef CONFIG_FLUX_ELASTIC_MEMORY
+#include <asm/elastic.h>
+#endif
 
 unsigned long memory_start, memory_end;
 
@@ -17,6 +23,22 @@ unsigned long mem_size;
 unsigned long mem_block_size;
 unsigned long *mem_blocks;
 static unsigned long dma_mem_size;
+
+#ifdef CONFIG_FLUX_STATIC_HUGETLB_SHARE
+/* 0: base pages, 1: 512 MiB hugetlb VMAs, 2: shareable 1 GiB VMAs. */
+static unsigned int static_hugetlb = 2;
+
+static int __init setup_static_hugetlb(char *str)
+{
+	unsigned int value;
+
+	if (kstrtouint(str, 0, &value) || value > 2)
+		return -EINVAL;
+	static_hugetlb = value;
+	return 0;
+}
+early_param("static_hugetlb", setup_static_hugetlb);
+#endif
 
 static inline void update_max_low_pfn(phys_addr_t end)
 {
@@ -38,10 +60,10 @@ static unsigned long __init bootmem_node_chunk(unsigned long size,
 	return (unsigned long)chunk_units * unit;
 }
 
-static void __init bootmem_alloc_region(unsigned long *base, unsigned long size,
-					unsigned long alloc_align,
-					unsigned long split_align,
-					unsigned int alloc_flags)
+static void __init __maybe_unused
+bootmem_alloc_region(unsigned long *base, unsigned long size,
+		     unsigned long alloc_align, unsigned long split_align,
+		     unsigned int alloc_flags)
 {
 	int nid, nr_nodes;
 
@@ -92,10 +114,71 @@ void __init bootmem_init(unsigned long mem_sz, unsigned long dma_sz)
 	}
 
 	base_addr = memory_start;
+#ifdef CONFIG_FLUX_STATIC_HUGETLB_SHARE
+	{
+		unsigned long pool_size = 0, static_size, left, chunk;
+		phys_addr_t allocated;
+
+#ifdef CONFIG_FLUX_ELASTIC_MEMORY
+		pool_size = CONFIG_FLUX_ELASTIC_POOL_MB * SZ_1M;
+		if (pool_size % SZ_2M || normal_mem_size < pool_size + SZ_64M)
+			panic("invalid Flux elastic pool layout");
+#endif
+		if (static_hugetlb == 2) {
+			long features = flux_host_dev_call_mm(FLUX_DEV_IO_MM_FEATURES, 0);
+
+			if (features < 0 || !(features & FLUX_MM_FEATURE_HUGETLB_PMD_SHARE)) {
+				flux_debug("host hugetlb PMD sharing is unavailable\n");
+				flux_ops_panic();
+			}
+		}
+		static_size = mem_size - pool_size;
+		if (!static_size || static_size % SZ_1G || memory_start % SZ_1G)
+			panic("Flux static hugetlb memory must be 1 GiB aligned");
+		left = static_size;
+		while (left) {
+			chunk = static_hugetlb == 1 ? SZ_512M : left;
+			allocated = (phys_addr_t)flux_ops_page_alloc((void *)base_addr,
+				chunk, static_hugetlb ? SZ_2M : PAGE_SIZE,
+				static_hugetlb ? FLUX_PAGE_ALLOC_STATIC_HUGE : 0);
+			if (allocated != base_addr)
+				panic("Flux static memory allocation failed");
+			memblock_add_node(base_addr, chunk, 0, 0);
+			base_addr += chunk;
+			left -= chunk;
+		}
+		pr_info("Flux static memory: mode %u, %lu MiB\n",
+			static_hugetlb, static_size >> 20);
+#ifdef CONFIG_FLUX_ELASTIC_MEMORY
+		flux_elastic_bootmem(base_addr, pool_size);
+		memblock_add_node(base_addr, pool_size, 0, 0);
+		memblock_reserve(base_addr, pool_size);
+		base_addr += pool_size;
+#endif
+	}
+#else
 	bootmem_alloc_region(&base_addr, dma_mem_size, mem_block_size,
 			     mem_block_size, FLUX_PAGE_ALLOC_DMA);
+#ifdef CONFIG_FLUX_ELASTIC_MEMORY
+	/* Reserve once; these pages never enter buddy or its per-CPU caches. */
+	{
+		unsigned long pool_size = CONFIG_FLUX_ELASTIC_POOL_MB * SZ_1M;
+
+		if (pool_size % SZ_2M || normal_mem_size < pool_size + SZ_64M ||
+		    memory_end % SZ_2M)
+			panic("invalid Flux elastic pool layout");
+		bootmem_alloc_region(&base_addr, normal_mem_size - pool_size,
+				     PAGE_SIZE, PAGE_SIZE, 0);
+		flux_elastic_bootmem(base_addr, pool_size);
+		memblock_add_node(base_addr, pool_size, 0, 0);
+		memblock_reserve(base_addr, pool_size);
+		base_addr += pool_size;
+	}
+#else
 	bootmem_alloc_region(&base_addr, normal_mem_size, PAGE_SIZE, PAGE_SIZE,
 			     0);
+#endif
+#endif
 	if (base_addr != memory_end) {
 		flux_debug("bootmem layout mismatch: 0x%lx != 0x%lx\n",
 			   base_addr, memory_end);

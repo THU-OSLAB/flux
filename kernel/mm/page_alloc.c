@@ -52,6 +52,7 @@
 #include <linux/psi.h>
 #include <linux/khugepaged.h>
 #include <linux/delayacct.h>
+#include <linux/flux_elastic.h>
 #include <asm/div64.h>
 #include "internal.h"
 #include "shuffle.h"
@@ -1265,6 +1266,8 @@ static void __free_pages_ok(struct page *page, unsigned int order,
 
 	if (!free_pages_prepare(page, order, fpi_flags))
 		return;
+	if (flux_elastic_free(page, order))
+		return;
 
 	/*
 	 * Calling get_pfnblock_migratetype() without spin_lock_irqsave() here
@@ -2404,6 +2407,8 @@ void free_unref_page(struct page *page, unsigned int order)
 
 	if (!free_unref_page_prepare(page, pfn, order))
 		return;
+	if (flux_elastic_free(page, order))
+		return;
 
 	/*
 	 * We only track unmovable, reclaimable and movable on pcp lists.
@@ -2450,6 +2455,13 @@ void free_unref_page_list(struct list_head *list)
 		unsigned long pfn = page_to_pfn(page);
 		if (!free_unref_page_prepare(page, pfn, 0)) {
 			list_del(&page->lru);
+			continue;
+		}
+
+		if (flux_elastic_contains(page)) {
+			/* Unlink before publishing: allocation can immediately reuse lru. */
+			list_del(&page->lru);
+			flux_elastic_free(page, 0);
 			continue;
 		}
 
@@ -3113,6 +3125,13 @@ retry:
 				alloc_flags &= ~ALLOC_NOFRAGMENT;
 				goto retry;
 			}
+		}
+
+		/* Separate inventory: buddy watermarks do not count these pages. */
+		page = flux_elastic_alloc(zone, order, gfp_mask);
+		if (page) {
+			prep_new_page(page, order, gfp_mask, alloc_flags);
+			return page;
 		}
 
 		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);

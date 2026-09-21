@@ -62,7 +62,8 @@ static inline void trans_init_3tuple(struct trans_entry *e, uint8_t proto,
  */
 static inline void trans_init_5tuple(struct trans_entry *e, uint8_t proto,
 				     const struct trans_ops *ops,
-				     struct net_addr laddr, struct net_addr raddr)
+				     struct net_addr laddr,
+				     struct net_addr raddr)
 {
 	e->match = TRANS_MATCH_5TUPLE;
 	e->proto = proto;
@@ -76,5 +77,6 @@ extern int trans_table_add_with_ephemeral_port(struct trans_entry *e);
 extern void trans_table_remove(struct trans_entry *e);
 
 extern void trans_error(struct mbuf *m, int err);
+extern bool net_rx_trans_match(struct mbuf *m);
 
 #endif

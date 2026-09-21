@@ -24,6 +24,12 @@ extern void flux_start_kernel(struct flux_host_info *host, const char *cmd_line,
 extern void flux_start_kernel_secondary(int cpu);
 #endif
 
+extern int flux_mpk_uaccess_init(void);
+
+/* Runtime record updates contain no application-memory accesses. */
+extern void flux_rewrite_state_lock(void);
+extern void flux_rewrite_state_unlock(void);
+
 /**
  * flux_syscall - entry point for syscalls from user space. This function
  * includes the shim layer that distinguishes between Flux-handled and
@@ -36,6 +42,21 @@ extern void flux_start_kernel_secondary(int cpu);
  * Return: syscall return value.
  */
 extern long flux_syscall(void);
+
+/**
+ * flux_syscall_dispatch - select the fast or full-context syscall entry
+ *
+ * Arguments use the standard Linux x86_64 syscall calling convention.
+ */
+extern long flux_syscall_dispatch(void);
+
+/**
+ * flux_syscall_sigreturn_nostack - rt_sigreturn entry for a restorer that
+ * cannot push a synthetic return address onto a read-only signal stack
+ *
+ * Arguments use the standard Linux x86-64 syscall calling convention.
+ */
+extern long flux_syscall_sigreturn_nostack(void);
 
 /**
  * flux_syscall_env - entry point for syscalls from user space already on kernel
@@ -69,12 +90,19 @@ extern long flux_syscall_fast(long nr, long arg1, long arg2, long arg3,
  * @sig: signal number
  * @info: siginfo_t pointer
  * @ucontext: ucontext_t pointer
+ * @interrupted_pkru: PKRU captured by the host signal-frame hook
+ * @flux_cpu: registered Flux CPU receiving the host signal
+ * @captured_uif: UIF captured and cleared by kmod before host CPL3 entry
  */
-extern void flux_signal_handler(int sig, void *info, void *ucontext,
-				unsigned int interrupted_pkru);
+/* Return positive for a handled trap, negative for a rejected MPK operation. */
+extern int flux_signal_handler(int sig, void *info, void *ucontext,
+					unsigned int interrupted_pkru,
+					int flux_cpu, int captured_uif);
+
+extern long flux_kernel_exec(const char *path, char **argv, char **envp);
 
 /**
- * flux_sys_host_mmap - mmap a memory region from the host
+ * flux_sys_mmap - map through LibOS Linux MM and executable-byte policy
  *
  * @addr: memory address
  * @len: memory length
@@ -115,8 +143,7 @@ extern void flux_kfree(const void *addr);
 extern int flux_is_kernel_memory(const void *ptr);
 
 typedef enum {
-	FLUX_IPI_EXIT = 0,
-	FLUX_IPI_RESCHED,
+	FLUX_IPI_RESCHED = 0,
 	FLUX_IPI_CALLFUNC,
 	FLUX_IPI_TICKBC,
 	FLUX_IPI_SHUTDOWN,
@@ -124,20 +151,11 @@ typedef enum {
 	FLUX_IPI_NR = FLUX_IPI_LAST
 } flux_ipi_type;
 
-#define FLUX_IPI_EXIT_BIT BIT(FLUX_IPI_EXIT)
-#define FLUX_IPI_RESCHED_BIT BIT(FLUX_IPI_RESCHED)
-#define FLUX_IPI_CALLFUNC_BIT BIT(FLUX_IPI_CALLFUNC)
-#define FLUX_IPI_TICKBC_BIT BIT(FLUX_IPI_TICKBC)
-#define FLUX_IPI_SHUTDOWN_BIT BIT(FLUX_IPI_SHUTDOWN)
-#define FLUX_IPI_MASK                                                       \
-	(FLUX_IPI_EXIT_BIT | FLUX_IPI_RESCHED_BIT | FLUX_IPI_CALLFUNC_BIT | \
-	 FLUX_IPI_TICKBC_BIT | FLUX_IPI_SHUTDOWN_BIT)
-
-#ifdef CONFIG_FLUX_UINTR
 /**
  * flux_uintr_handler - user interrupt handler.
  */
 extern void flux_uintr_handler(void);
+extern void flux_uintr_signal_stack(void);
 
 enum {
 	FLUX_UINTR_VECTOR_TIMER = 1,
@@ -162,8 +180,6 @@ struct flux_uipi_vec_info {
 struct flux_uipi_pcpu {
 	struct flux_uipi_vec_info vecs[FLUX_UINTR_VEC_NR];
 };
-
-#endif
 
 #define FLUX_FD_OFFSET (512)
 

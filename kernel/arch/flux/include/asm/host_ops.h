@@ -53,104 +53,6 @@ static inline void flux_host_call_restore_fsbase(u64 fsbase)
 	asm volatile("wrfsbase %0" : : "r"(fsbase));
 }
 
-#ifdef CONFIG_FLUX_UINTR
-
-#include <asm/x86/fpu.h>
-#include <asm/x86/irqflags.h>
-
-static __always_inline struct xregs_state *flux_host_call_current_xstate(void)
-{
-	/*
-	 * __switch_to() maintains stack_top as task_stack_top(current), which
-	 * is task_xstate(current).  Avoid task_xstate() here because this
-	 * header is also pulled in from asm/string.h's early include path.
-	 */
-	return (struct xregs_state *)this_cpu_read(tls_pcpu.stack_top);
-}
-
-#define FLUX_HOST_CALL_FPU_BEGIN()                                  \
-	do {                                                        \
-		if (!test_thread_flag(TIF_NEED_FPU_LOAD) &&         \
-		    test_thread_flag(TIF_UINTR_FROM_USER)) {       \
-			save_xstate(flux_host_call_current_xstate()); \
-			set_thread_flag(TIF_NEED_FPU_LOAD);        \
-		}                                                   \
-	} while (0)
-
-#define FLUX_HOST_CALL_FPU_END() \
-	do {                     \
-	} while (0)
-
-#define FLUX_HOST_CALL_BEGIN(__flags, __fsbase)             \
-	u64 __flags = arch_local_irq_save();                \
-	u64 __fsbase = flux_host_call_save_fsbase();        \
-	flux_host_call_restore_fsbase(flux_host_fsbase());  \
-	FLUX_HOST_CALL_FPU_BEGIN()
-
-#define FLUX_HOST_CALL_END(__flags, __fsbase) \
-	FLUX_HOST_CALL_FPU_END();             \
-	flux_host_call_restore_fsbase(__fsbase); \
-	arch_local_irq_restore(__flags)
-
-#define FLUX_HOST_CALL_VOID0(__ops, __fn)                          \
-	static __always_inline void __ops##_##__fn(void)           \
-	{                                                          \
-		FLUX_HOST_CALL_BEGIN(__flags, __fsbase);           \
-		__ops->__fn();                                     \
-		FLUX_HOST_CALL_END(__flags, __fsbase);             \
-	}                                                          \
-	static __always_inline void __ops##_##__fn##_raw(void)     \
-	{                                                          \
-		__ops->__fn();                                     \
-	}
-
-#define FLUX_HOST_CALL_VOIDx(x, __ops, __fn, ...)                        \
-	static __always_inline void __ops##_##__fn(                      \
-		__FLUX_MAP(x, __FLUX_SC_DECL, __VA_ARGS__))              \
-	{                                                                \
-		FLUX_HOST_CALL_BEGIN(__flags, __fsbase);                 \
-		__ops->__fn(__FLUX_MAP(x, __FLUX_SC_ARGS, __VA_ARGS__)); \
-		FLUX_HOST_CALL_END(__flags, __fsbase);                   \
-	}                                                                \
-	static __always_inline void __ops##_##__fn##_raw(                \
-		__FLUX_MAP(x, __FLUX_SC_DECL, __VA_ARGS__))              \
-	{                                                                \
-		__ops->__fn(__FLUX_MAP(x, __FLUX_SC_ARGS, __VA_ARGS__)); \
-	}
-
-#define FLUX_HOST_CALL0(__ops, __fn, __rettype)                     \
-	static __always_inline __rettype __ops##_##__fn(void)       \
-	{                                                           \
-		__rettype __ret;                                    \
-		FLUX_HOST_CALL_BEGIN(__flags, __fsbase);            \
-		__ret = __ops->__fn();                              \
-		FLUX_HOST_CALL_END(__flags, __fsbase);              \
-		return __ret;                                       \
-	}                                                           \
-	static __always_inline __rettype __ops##_##__fn##_raw(void) \
-	{                                                           \
-		return __ops->__fn();                               \
-	}
-
-#define FLUX_HOST_CALLx(x, __ops, __fn, __rettype, ...)              \
-	static __always_inline __rettype __ops##_##__fn(             \
-		__FLUX_MAP(x, __FLUX_SC_DECL, __VA_ARGS__))          \
-	{                                                            \
-		__rettype __ret;                                     \
-		FLUX_HOST_CALL_BEGIN(__flags, __fsbase);             \
-		__ret = __ops->__fn(                                 \
-			__FLUX_MAP(x, __FLUX_SC_ARGS, __VA_ARGS__)); \
-		FLUX_HOST_CALL_END(__flags, __fsbase);               \
-		return __ret;                                        \
-	}                                                            \
-	static __always_inline __rettype __ops##_##__fn##_raw(       \
-		__FLUX_MAP(x, __FLUX_SC_DECL, __VA_ARGS__))          \
-	{                                                            \
-		return __ops->__fn(                                  \
-			__FLUX_MAP(x, __FLUX_SC_ARGS, __VA_ARGS__)); \
-	}
-
-#else
 
 #define FLUX_HOST_CALL_BEGIN(__flags, __fsbase)            \
 	u64 __fsbase = flux_host_call_save_fsbase();       \
@@ -217,7 +119,6 @@ static __always_inline struct xregs_state *flux_host_call_current_xstate(void)
 			__FLUX_MAP(x, __FLUX_SC_ARGS, __VA_ARGS__)); \
 	}
 
-#endif
 
 typedef void (*flux_thread_fn_t)(void *);
 
@@ -260,9 +161,14 @@ FLUX_HOST_CALLx(4, flux_ops, iomem_access, int, const volatile void *, addr,
 		void *, val, int, size, int, write);
 FLUX_HOST_CALL0(flux_ops, gettid, long);
 FLUX_HOST_CALL0(flux_ops, getcpu, int);
+FLUX_HOST_CALL_VOID0(flux_ops, yield);
 FLUX_HOST_CALLx(2, flux_ops, uintr_register_ipi, int, int, cpu, int, vector);
-FLUX_HOST_CALLx(4, flux_ops, load_elf, int, const char *, path, char **, argv,
-		char **, envp, flux_post_exec_fn_t, post_exec);
+FLUX_HOST_CALLx(3, flux_ops, handle_mpk_fault, int, int, sig, void *, ucontext,
+		struct flux_mpk_cmp64 *, cmp);
+FLUX_HOST_CALLx(2, flux_ops, rewrite_exec, int, void *, addr, unsigned long,
+		len);
+FLUX_HOST_CALLx(3, flux_ops, invalidate_exec, int, void *, addr,
+		unsigned long, len, bool, restore);
 
 #ifdef CONFIG_FLUX_SPDK
 #include <uapi/asm/spdk.h>

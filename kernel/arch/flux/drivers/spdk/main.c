@@ -8,6 +8,7 @@
 #include <linux/miscdevice.h>
 #include <linux/slab.h>
 #include <linux/kthread.h>
+#include <linux/delay.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/spinlock_types.h>
@@ -357,6 +358,18 @@ static struct block_device_operations spdk_blk_mq_bdev_ops = {
 	.owner = THIS_MODULE,
 };
 
+/* A qpair has no interrupt path. Keep polling latency below a scheduler tick,
+ * but yield after making progress so one busy queue cannot monopolize a CPU. */
+static void spdk_poll_wait(struct spdk_poll_ctx *ctx, int completed)
+{
+	if (!ctx->qlen)
+		return;
+	if (completed)
+		cond_resched();
+	else
+		usleep_range(10, 20);
+}
+
 static int spdk_poll_thread(void *arg)
 {
 	struct spdk_poll_ctx *ctx = arg;
@@ -367,8 +380,7 @@ static int spdk_poll_thread(void *arg)
 						 ctx->qlen > 0 ||
 							 kthread_should_stop());
 		}
-		spdk_complete_requests(ctx);
-		io_schedule();
+		spdk_poll_wait(ctx, spdk_complete_requests(ctx));
 	}
 
 	return 0;

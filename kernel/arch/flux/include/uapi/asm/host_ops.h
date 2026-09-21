@@ -2,8 +2,10 @@
 #define _ASM_UAPI_FLUX_HOST_OPS_H
 
 #ifdef __KERNEL__
-#include <uapi/asm/mpk.h>
+#include <linux/types.h>
+#include <asm/mpk.h>
 #else
+#include <stdbool.h>
 #include <kernel/asm/mpk.h>
 #endif
 
@@ -13,8 +15,9 @@
  * page_alloc() uses the low bits to preserve the existing NUMA node encoding
  * and reserves upper bits for allocation-type flags.
  */
-#define FLUX_PAGE_ALLOC_NODE_MASK 0x0000ffffU
-#define FLUX_PAGE_ALLOC_DMA       0x00010000U
+#define FLUX_PAGE_ALLOC_NODE_MASK   0x0000ffffU
+#define FLUX_PAGE_ALLOC_DMA         0x00010000U
+#define FLUX_PAGE_ALLOC_STATIC_HUGE 0x00020000U
 
 #define FLUX_PAGE_ALLOC_MAKE_FLAGS(node, flags) \
 	(((node) & FLUX_PAGE_ALLOC_NODE_MASK) | (flags))
@@ -38,8 +41,6 @@ enum flux_prot {
 	FLUX_PROT_WRITE = 2,
 	FLUX_PROT_EXEC = 4,
 };
-
-typedef void (*flux_post_exec_fn_t)(void *entry, unsigned long stack);
 
 /**
  * flux_host_operations - host operations used by the Linux kernel
@@ -94,10 +95,10 @@ typedef void (*flux_post_exec_fn_t)(void *entry, unsigned long stack);
  *
  * @uintr_register_ipi - register a UINTR handler for the given CPU and vector
  *
- * @load_elf - load an ELF binary from the host filesystem and prepare it for
- * execution in the kernel; the post_exec callback will be called with the entry
- * point and initial stack pointer of the loaded binary, and can perform
- * additional initialization before the kernel starts executing the binary.
+ * @rewrite_exec - rewrite and validate private, writable, NX bytes prepared
+ * by the LibOS MM caller before granting application execution permission.
+ * @invalidate_exec - discard rewrite records; when restore is requested, the
+ * caller must first make the range writable. The backend never changes VMAs.
  */
 struct flux_host_operations {
 	void (*print)(const char *str, int len);
@@ -147,13 +148,20 @@ struct flux_host_operations {
 	long (*gettid)(void);
 	int (*getcpu)(void);
 
+	void (*yield)(void);
+
 	int (*uintr_register_ipi)(int cpu, int vector);
 
-	int (*load_elf)(const char *path, char **argv, char **envp,
-			flux_post_exec_fn_t fn);
+	/* Caller holds the owning mm's host_rewrite_state_mutex. */
+	int (*handle_mpk_fault)(int sig, void *ucontext,
+				struct flux_mpk_cmp64 *cmp);
+	int (*rewrite_exec)(void *addr, unsigned long len);
+	int (*invalidate_exec)(void *addr, unsigned long len, bool restore);
 };
 
 struct flux_host_info {
+	const char *elf_interpreter;
+	unsigned long hwcap, hwcap2;
 	struct flux_host_operations *ops;
 #ifdef CONFIG_FLUX_SPDK
 	struct flux_spdk *spdk;
@@ -161,13 +169,15 @@ struct flux_host_info {
 	struct flux_uipi_pcpu *uipi;
 	void (*main)(void *);
 	unsigned long *fsbases;
-	void *vvar;
 	int max_cpus;
+	int nr_cpus;
 };
 
 struct flux_rodata {
 	void *syscall_fast;
 	void *syscall;
+	void *syscall_rewrite;
+	void *syscall_sigreturn_nostack;
 } __attribute__((__aligned__(4096)));
 
 #define FLUX_RODATA_ADDR 0x100000

@@ -26,15 +26,15 @@ export srctree
 
 include $(srctree)/tools/scripts/Makefile.include
 include scripts/flux-paths.mk
-CLEAN_CONFIG_GOALS := clean mrproper clean-conf
+NO_CONFIG_GOALS := clean mrproper clean-conf compile-commands
 
 # Reuse an existing kernel .config as the base so top-level builds pick up
 # menuconfig changes instead of regenerating from defconfig every time.
-# Skip this for pure cleanup invocations; otherwise GNU make will try to
-# rebuild the included .config before running `clean`.
+# Skip cleanup and compilation-database-only invocations; neither should
+# regenerate the current build configuration.
 ifeq ($(strip $(MAKECMDGOALS)),)
 -include $(KERNEL_OUT)/.config
-else ifneq ($(filter-out $(CLEAN_CONFIG_GOALS),$(MAKECMDGOALS)),)
+else ifneq ($(filter-out $(NO_CONFIG_GOALS),$(MAKECMDGOALS)),)
 -include $(KERNEL_OUT)/.config
 endif
 include scripts/flux-config.mk
@@ -63,14 +63,6 @@ CONFIG_SIGNATURE := $(strip $(foreach name,$(CONFIG_EXPORTS),$(name)=$(strip $(C
 THIRD_PARTY_LIBS := $(if $(wildcard $(CURDIR)/third-party),$(CURDIR)/third-party,$(OUTPUT)third-party)
 FLUX_DIR := flux
 FLUX_OBJ_DIR := $(OUTPUT)$(FLUX_DIR)/
-FLUX_VDSO_SRC_DIR := $(CURDIR)/$(FLUX_DIR)/vdso
-FLUX_VDSO_OBJ_DIR := $(FLUX_OBJ_DIR)vdso
-FLUX_VDSO_ENTRY := $(FLUX_VDSO_OBJ_DIR)/flux-vdso-entry.o
-FLUX_VDSO_TIME := $(FLUX_VDSO_OBJ_DIR)/flux-vdso-time.o
-FLUX_VDSO_OBJS := $(FLUX_VDSO_ENTRY) $(FLUX_VDSO_TIME)
-FLUX_VDSO_SO := $(FLUX_VDSO_OBJ_DIR)/flux-vdso.so
-FLUX_VDSO_IMAGE := $(FLUX_VDSO_OBJ_DIR)/flux-vdso-image.o
-FLUX_VDSO_LDS := $(FLUX_VDSO_SRC_DIR)/flux-vdso.lds
 
 ifeq ($(CONFIG_FLUX_FNET),y)
 PKG_CONFIG_PATH := $(THIRD_PARTY_LIBS)/rdma-core/build/lib/pkgconfig:$(PKG_CONFIG_PATH)
@@ -98,6 +90,9 @@ FNET_LDLIBS-$(CONFIG_FLUX_FNET) += $(MLX5_LIBS)
 SPDK_CFLAGS-$(CONFIG_FLUX_SPDK) += -I$(THIRD_PARTY_LIBS)/spdk/build/include
 SPDK_CFLAGS-$(CONFIG_FLUX_SPDK) += $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags spdk_nvme spdk_env_dpdk)
 SPDK_LDLIBS-$(CONFIG_FLUX_SPDK) += -L$(THIRD_PARTY_LIBS)/spdk/build/lib -lspdk
+# Keep the decoder and its dependencies in the runtime image: each separate
+# DSO adds VMAs that native dup_mm must reproduce for every LibOS process.
+REWRITE_LDLIBS := -Wl,-Bstatic -lopcodes -lbfd -liberty -lz -lzstd -lsframe -Wl,-Bdynamic
 
 INC := -Iinclude \
 	-I$(CURDIR)/$(FLUX_DIR) \
@@ -113,9 +108,7 @@ export CFLAGS += $(INC) $(INC-y)\
 	-Wall -g -O3 -Wextra -Wno-unused-parameter -Wno-missing-field-initializers \
 	-fno-strict-aliasing -fno-omit-frame-pointer \
 	-mssse3 # for fnet/iokd dataplane
-ifeq ($(CONFIG_FLUX_UINTR),y)
 export CFLAGS += -muintr
-endif
 
 DEBUG ?=
 ifeq ($(DEBUG),1)
@@ -136,6 +129,8 @@ flux-runtime-deps-y += $(EXEC_DIR)/flux-iokd$(EXESUF)
 expand-targets = $(foreach t,$(1),$(if $(filter .%,$(t)),$(t),$(OUTPUT)$(t)$(2)))
 expand-prog-targets = $(foreach t,$(1),$(EXEC_DIR)/$(t)$(EXESUF))
 
+# fixdep watches these split-config markers rather than generated autoconf.h.
+# Recreate them whenever the exported Flux configuration changes.
 define flux_sync_config
 tmp_autoconf=$$(mktemp); \
 tmp_config=$$(mktemp); \
@@ -150,6 +145,7 @@ mkdir -p $(dir $(AUTOCONF_H)); \
 if ! cmp -s $$tmp_autoconf $(AUTOCONF_H) 2>/dev/null; then mv $$tmp_autoconf $(AUTOCONF_H); changed=1; else rm -f $$tmp_autoconf; fi; \
 if ! cmp -s $$tmp_config $(FLUX_CONFIG) 2>/dev/null; then mv $$tmp_config $(FLUX_CONFIG); changed=1; else rm -f $$tmp_config; fi; \
 if [ "$$changed" -eq 1 ] || [ ! -f $(CONFIG_STAMP) ] || [ "$$(cat $(CONFIG_STAMP) 2>/dev/null || true)" != '$(CONFIG_SIGNATURE)' ]; then \
+	$(RM) $(KERNEL_OUT)/include/config/FLUX_*; \
 	printf '%s\n' '$(CONFIG_SIGNATURE)' > $(CONFIG_STAMP); \
 fi
 endef
@@ -157,6 +153,10 @@ endef
 TARGETS := $(call expand-prog-targets,$(progs-y))
 TARGETS += $(call expand-targets,$(libs-y),$(SOSUF))
 all: $(TARGETS)
+
+# Collect saved commands after all recursive builds have finished.
+all compile-commands:
+	$(Q)python3 scripts/gen_compile_commands.py --build-dir "$(BUILD_DIR)"
 
 
 ASM_UAPI_GENERATED:=$(KERNEL_OUT)/arch/flux/include/generated/uapi/asm
@@ -215,46 +215,12 @@ $(OUTPUT)libflux.a: $(FLUX_OBJ_DIR)libflux-in.o $(OUTPUT)lib/flux.o
 	$(QUIET_AR)$(AR) -rc $@ $^
 
 # rule to link flux
-$(FLUX_VDSO_ENTRY): $(FLUX_VDSO_SRC_DIR)/flux-vdso.S
-	$(Q)mkdir -p $(dir $@)
-	$(QUIET_CC)$(CC) -c -m64 -fPIC -fno-stack-protector \
-		-Wa,--noexecstack -o $@ $<
-
-$(FLUX_VDSO_TIME): $(FLUX_VDSO_SRC_DIR)/flux-vdso.c $(KERNEL_FLUX_O)
-	$(Q)mkdir -p $(dir $@)
-	$(QUIET_CC)$(CC) -c -m64 -O2 -fPIC -fno-stack-protector \
-		-fno-builtin -fno-asynchronous-unwind-tables -mno-red-zone \
-		-I$(KERNEL_DIR)/arch/flux/include/uapi \
-		-I$(KERNEL_OUT)/arch/flux/include/generated/uapi \
-		-I$(KERNEL_DIR)/include/uapi \
-		-include $(KERNEL_OUT)/include/generated/autoconf.h \
-		-o $@ $<
-
-$(FLUX_VDSO_SO): $(FLUX_VDSO_OBJS) $(FLUX_VDSO_LDS) $(FLUX_VDSO_SRC_DIR)/flux-vdso.map
-	$(QUIET_LINK)$(LD) -shared --hash-style=both -Bsymbolic --no-undefined -z noexecstack \
-		-z max-page-size=4096 -soname linux-vdso.so.1 \
-		-T $(FLUX_VDSO_LDS) \
-		--version-script=$(FLUX_VDSO_SRC_DIR)/flux-vdso.map \
-		-o $@ $(FLUX_VDSO_OBJS)
-	$(Q)$(CROSS_COMPILE)readelf -lW $@ | awk \
-		'$$1 == "LOAD" { count++; if ($$3 != "0x0000000000000000" || $$0 ~ /[[:space:]]R?W(E)?[[:space:]]/) bad = 1 } \
-		 END { exit !(count == 1 && !bad) }' || \
-		{ echo "Flux vDSO must have one non-writable PT_LOAD at virtual address zero" >&2; exit 1; }
-	$(Q)! $(CROSS_COMPILE)readelf -rW $@ | grep -q 'R_X86_64_' || \
-		{ echo "Flux vDSO must not contain dynamic relocations" >&2; exit 1; }
-
-$(FLUX_VDSO_IMAGE): $(FLUX_VDSO_SO)
-	$(Q)cd $(dir $<) && $(LD) -r -b binary $(notdir $<) \
-		-o $(notdir $@)
-	$(Q)$(CROSS_COMPILE)objcopy --rename-section \
-		.data=.rodata.flux_vdso,alloc,load,readonly,data,contents $@
-
-$(EXEC_DIR)/flux$(EXESUF): $(FLUX_OBJ_DIR)flux-in.o $(OUTPUT)libflux.a $(FLUX_VDSO_IMAGE) | $(EXEC_DIR) $(flux-runtime-deps-y)
-	$(QUIET_LINK)$(CC) $(LDFLAGS) $(FLUX_RUNTIME_RPATH-y) -o $@ $^ $(LDLIBS) $(LDLIBS-y) $(SPDK_LDLIBS-y)
+$(EXEC_DIR)/flux$(EXESUF): $(FLUX_OBJ_DIR)flux-in.o $(OUTPUT)libflux.a | $(EXEC_DIR) $(flux-runtime-deps-y)
+	$(QUIET_LINK)$(CC) $(LDFLAGS) $(FLUX_RUNTIME_RPATH-y) -o $@ $^ $(LDLIBS) $(LDLIBS-y) $(SPDK_LDLIBS-y) $(REWRITE_LDLIBS)
 	$(Q)if [ -n "$(FLUX_RUNTIME_RPATH_STR-y)" ] && command -v patchelf >/dev/null 2>&1; then patchelf --force-rpath --set-rpath $(FLUX_RUNTIME_RPATH_STR-y) $@; fi
 
-$(EXEC_DIR)/flux-runc$(EXESUF): $(FLUX_OBJ_DIR)flux-runc-in.o $(OUTPUT)libflux.a $(FLUX_VDSO_IMAGE) | $(EXEC_DIR) $(flux-runtime-deps-y)
-	$(QUIET_LINK)$(CC) $(LDFLAGS) $(FLUX_RUNTIME_RPATH-y) -o $@ $^ $(LDLIBS) $(LDLIBS-y) $(SPDK_LDLIBS-y)
+$(EXEC_DIR)/flux-runc$(EXESUF): $(FLUX_OBJ_DIR)flux-runc-in.o $(OUTPUT)libflux.a | $(EXEC_DIR) $(flux-runtime-deps-y)
+	$(QUIET_LINK)$(CC) $(LDFLAGS) $(FLUX_RUNTIME_RPATH-y) -o $@ $^ $(LDLIBS) $(LDLIBS-y) $(SPDK_LDLIBS-y) $(REWRITE_LDLIBS)
 	$(Q)if [ -n "$(FLUX_RUNTIME_RPATH_STR-y)" ] && command -v patchelf >/dev/null 2>&1; then patchelf --force-rpath --set-rpath $(FLUX_RUNTIME_RPATH_STR-y) $@; fi
 
 $(EXEC_DIR)/flux-iokd$(EXESUF): $(FLUX_OBJ_DIR)iokd-in.o | $(EXEC_DIR)
@@ -288,7 +254,6 @@ clean:
 	fi
 	$(call QUIET_CLEAN, headers)$(RM) -r $(OUTPUT)include/kernel/
 	$(call QUIET_CLEAN, libflux.a)$(RM) $(OUTPUT)libflux.a
-	$(call QUIET_CLEAN, vdso)$(RM) -r $(FLUX_VDSO_OBJ_DIR)
 	$(call QUIET_CLEAN, targets)$(RM) $(TARGETS)
 
 mrproper: clean
@@ -299,7 +264,7 @@ clean-conf:
 	$(call QUIET_CLEAN, .config)$(RM) $(FLUX_CONFIG)
 
 FORCE: ;
-.PHONY: all clean mrproper conf conf-kernel menuconfig FORCE kernel-check
+.PHONY: all compile-commands clean mrproper conf conf-kernel menuconfig FORCE kernel-check
 .NOTPARALLEL : $(OUTPUT)lib/flux.o
 .SECONDARY:
 .WAIT:

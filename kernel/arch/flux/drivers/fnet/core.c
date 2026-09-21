@@ -4,7 +4,6 @@
 
 #define pr_fmt(fmt) "<fnet> " KBUILD_MODNAME ": " fmt
 
-#include <asm/host_ops.h>
 #include <linux/etherdevice.h>
 #include <linux/ip.h>
 #include <net/arp.h>
@@ -27,7 +26,8 @@ static struct kmem_cache *rx_mbuf_cache;
 static int net_rx_mbuf_cache_init(void)
 {
 	rx_mbuf_cache = kmem_cache_create("rx_mbuf_cache", MBUF_HEAD_LEN, 0,
-					 SLAB_HWCACHE_ALIGN | SLAB_PANIC, NULL);
+					  SLAB_HWCACHE_ALIGN | SLAB_PANIC,
+					  NULL);
 	return rx_mbuf_cache ? 0 : -ENOMEM;
 }
 core_initcall(net_rx_mbuf_cache_init);
@@ -37,7 +37,7 @@ static inline void net_rx_send_comp(unsigned long offset)
 	struct fnet_cpu *cpu = fnet_get_cpu();
 	union flux_txcmdq_cmd cmd = { .txcmd = FLUX_TXCMD_NET_COMP };
 
-	if (unlikely(!lrpc_send(&cpu->txcmdq, cmd.lrpc_cmd, offset)))
+	if (unlikely(!lrpc_send(&cpu->lrpc.txcmdq, cmd.lrpc_cmd, offset)))
 		BUG();
 	fnet_put_cpu();
 }
@@ -93,14 +93,38 @@ static inline bool ip_hdr_supported(const struct iphdr *iphdr)
 	/* must be IPv4, no IP options, no IP fragments */
 	return (iphdr->version == IPVERSION &&
 		iphdr->ihl == sizeof(*iphdr) / sizeof(uint32_t) &&
-		(iphdr->frag_off & IP_MF) == 0);
+		(ntohs(iphdr->frag_off) & (IP_MF | IP_OFFSET)) == 0);
+}
+
+static __always_inline const struct iphdr *net_rx_parse_ipv4(struct mbuf *m)
+{
+	const struct iphdr *iphdr;
+	uint16_t len;
+
+	mbuf_mark_network_offset(m);
+	iphdr = mbuf_pull_hdr_or_null(m, *iphdr);
+	if (unlikely(!iphdr))
+		return NULL;
+
+	/* Did HW checksum verification pass? */
+	if (m->csum_type != FLUX_CHKSUM_TYPE_UNNECESSARY &&
+	    chksum_internet(iphdr, sizeof(*iphdr)))
+		return NULL;
+	if (unlikely(!ip_hdr_supported(iphdr)))
+		return NULL;
+	len = be16_to_cpu(iphdr->tot_len) - sizeof(*iphdr);
+	if (unlikely(mbuf_length(m) < len))
+		return NULL;
+	if (len < mbuf_length(m))
+		mbuf_trim(m, mbuf_length(m) - len);
+
+	return iphdr;
 }
 
 static void net_rx_one(struct mbuf *m)
 {
 	const struct ethhdr *llhdr;
 	const struct iphdr *iphdr;
-	uint16_t len;
 
 	/*
 	 * Link Layer Processing (OSI L2)
@@ -114,24 +138,9 @@ static void net_rx_one(struct mbuf *m)
 	 * Network Layer Processing (OSI L3)
 	 */
 
-	mbuf_mark_network_offset(m);
-	iphdr = mbuf_pull_hdr_or_null(m, *iphdr);
+	iphdr = net_rx_parse_ipv4(m);
 	if (unlikely(!iphdr))
 		goto drop;
-
-	/* Did HW checksum verification pass? */
-	if (m->csum_type != FLUX_CHKSUM_TYPE_UNNECESSARY) {
-		if (chksum_internet(iphdr, sizeof(*iphdr)))
-			goto drop;
-	}
-
-	if (unlikely(!ip_hdr_supported(iphdr)))
-		goto drop;
-	len = be16_to_cpu(iphdr->tot_len) - sizeof(*iphdr);
-	if (unlikely(mbuf_length(m) < len))
-		goto drop;
-	if (len < mbuf_length(m))
-		mbuf_trim(m, mbuf_length(m) - len);
 
 	switch (iphdr->protocol) {
 	case IPPROTO_UDP:
@@ -146,6 +155,21 @@ static void net_rx_one(struct mbuf *m)
 
 drop:
 	mbuf_drop(m);
+}
+
+bool net_rx_fast_tcp(struct mbuf *m)
+{
+	const struct ethhdr *llhdr;
+	const struct iphdr *iphdr;
+
+	llhdr = mbuf_pull_hdr_or_null(m, *llhdr);
+	if (unlikely(!llhdr || llhdr->h_proto != htons(ETH_P_IP)))
+		return false;
+	iphdr = net_rx_parse_ipv4(m);
+	if (unlikely(!iphdr || iphdr->protocol != IPPROTO_TCP))
+		return false;
+
+	return net_rx_trans_match(m);
 }
 
 /**
@@ -189,21 +213,9 @@ bool flux_fast_net_rx_recv(unsigned long payload, union flux_rxq_cmd cmd)
 
 static bool net_tx_one(struct fnet_cpu *cpu, struct mbuf *m)
 {
-	union flux_txpktq_cmd cmd;
-	uint64_t payload;
-	uint16_t len = mbuf_length(m);
+	fnet_dbg("tx: mbuf 0x%llx len %u\n", (u64)m, mbuf_length(m));
 
-	cmd.dst_ip = m->tx_dst_ip;
-	cmd.txcmd = FLUX_TXPKT_NET_XMIT;
-	cmd.len = len;
-	cmd.olflags = m->txflags;
-
-	payload = flux_txpkt_payload_from_ptr((uint64_t)m, FLUX_MEMORY_ADDR,
-					      (uint16_t)m->hash);
-
-	fnet_dbg("tx: mbuf 0x%llx len %u\n", (u64)m, len);
-
-	return lrpc_send(&cpu->txpktq, cmd.lrpc_cmd, payload);
+	return fnet_ops.xmit_mbuf(cpu, m);
 }
 
 /* drains overflow queues */
@@ -319,43 +331,34 @@ static int net_probe_neigh(uint32_t daddr, struct ethaddr *dhost)
 {
 	struct neighbour *neigh;
 	const u64 retry_delay = 100; /* in micros */
-	int retry_cnt = 0;
 	__be32 daddr_be;
-	int ret;
+	int retry_cnt;
 
 	daddr_be = htonl(daddr);
 	if (likely(net_lookup_valid_neigh(daddr_be, dhost)))
 		return 0;
-retry:
-	neigh = neigh_lookup(&arp_tbl, &daddr_be, fnet_dev->dev);
-	if (neigh) {
-		if (neigh->nud_state & NUD_VALID) {
+
+	for (retry_cnt = 0; retry_cnt < 5; retry_cnt++) {
+		neigh = neigh_lookup(&arp_tbl, &daddr_be, fnet_dev->dev);
+		if (!neigh)
+			neigh = neigh_create(&arp_tbl, &daddr_be,
+					     fnet_dev->dev);
+		if (IS_ERR(neigh))
+			return PTR_ERR(neigh);
+
+		if (READ_ONCE(neigh->nud_state) & NUD_VALID) {
 			ether_addr_copy(dhost->addr, neigh->ha);
-			ret = 0;
-		} else {
-			neigh_event_send(neigh, NULL);
 			neigh_release(neigh);
-			udelay(retry_delay);
-			goto retry;
+			return 0;
 		}
+
+		neigh_event_send(neigh, NULL);
 		neigh_release(neigh);
-	} else {
-		neigh = neigh_create(&arp_tbl, &daddr_be, fnet_dev->dev);
-		if (!IS_ERR(neigh)) {
-			neigh_event_send(neigh, NULL);
-			neigh_release(neigh);
-		} else {
-			ret = PTR_ERR(neigh);
-			goto done;
-		}
-		if (++retry_cnt < 5) {
+		if (retry_cnt + 1 < 5)
 			udelay(retry_delay);
-			goto retry;
-		}
-		ret = -EHOSTUNREACH;
 	}
-done:
-	return ret;
+
+	return -EHOSTUNREACH;
 }
 
 /**

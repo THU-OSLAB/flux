@@ -3,7 +3,6 @@
 #include <linux/mman.h>
 #include <linux/module.h>
 #include <linux/cdev.h>
-#include <linux/version.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/file.h>
@@ -48,8 +47,10 @@ static long flux_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case FLUX_DEV_IO_EXECVE:
 		return flux_execve(arg);
 	case FLUX_DEV_IO_DUMP_VMAS:
-		flux_dump_vmas();
+		/* Retired diagnostic ioctl; use native /proc/<pid>/maps. */
 		return 0;
+	case FLUX_DEV_IO_REKEY_ALIASES:
+		return flux_rekey_aliases(arg);
 	default:
 		pr_err("unknown ioctl command: %u\n", cmd);
 		return -EINVAL; // Not a typewriter (invalid command)
@@ -76,6 +77,12 @@ static int flux_mmap(struct file *filp, struct vm_area_struct *vma)
 		vma->vm_start, vma->vm_end, shm_size, pfn, err);
 
 	return err;
+}
+
+/* The control mapping always projects the module's fixed shared allocation. */
+bool flux_control_vma_shared(const struct vm_area_struct *vma)
+{
+	return vma->vm_file && vma->vm_file->f_op->mmap == flux_mmap;
 }
 
 static long flux_uintr_ioctl(struct file *filp, unsigned int cmd,
@@ -114,8 +121,31 @@ static long flux_mm_ioctl(struct file *filp, unsigned int cmd,
 		return -EINVAL;
 
 	switch (cmd) {
+	case FLUX_DEV_IO_TAKE_FRAME_UINTR:
+		err = uintr_take_frame_fault(arg);
+		break;
+	case FLUX_DEV_IO_MM_FEATURES:
+		err = IS_ENABLED(CONFIG_HUGETLB_PMD_PAGE_TABLE_SHARING) ?
+			FLUX_MM_FEATURE_HUGETLB_PMD_SHARE : 0;
+		break;
+	case FLUX_DEV_IO_PREPARE_FORK_FAULTS:
+		/* The old bounded snapshot was optional; old guests fall back. */
+		err = -EOPNOTSUPP;
+		break;
+	case FLUX_DEV_IO_BIND_FORK_PROJECTION:
+		err = flux_bind_fork_projection(ctx, arg);
+		break;
+	case FLUX_DEV_IO_FLUSH_USER_MM:
+		err = flux_flush_user_mm(ctx, arg);
+		break;
+	case FLUX_DEV_IO_ELASTIC_CREATE:
+		err = flux_elastic_create(arg);
+		break;
 	case FLUX_DEV_IO_COPY_MM:
-		err = flux_copy_mm(ctx, (int __user *)arg);
+		err = flux_copy_mm(ctx, (int __user *)arg, true);
+		break;
+	case FLUX_DEV_IO_COPY_EXEC_MM:
+		err = flux_copy_mm(ctx, (int __user *)arg, false);
 		break;
 	case FLUX_DEV_IO_RELEASE_MM:
 		err = flux_release_mm(ctx, arg);
@@ -123,8 +153,38 @@ static long flux_mm_ioctl(struct file *filp, unsigned int cmd,
 	case FLUX_DEV_IO_SWITCH_MM:
 		err = flux_switch_mm(ctx, arg >> 32, arg);
 		break;
-	case FLUX_DEV_IO_CLEAN_MM:
-		err = flux_clean_mm(ctx, arg);
+	case FLUX_DEV_IO_RESERVE_ALIAS_RANGE:
+		err = flux_prepare_alias_reservation(ctx, arg);
+		break;
+	case FLUX_DEV_IO_ALIAS_PAGES:
+		err = flux_alias_pages(ctx, arg);
+		break;
+	case FLUX_DEV_IO_UNALIAS_USER_MM:
+		err = flux_unalias_user_mm(ctx, arg);
+		break;
+	case FLUX_DEV_IO_UNALIAS_PAGES:
+		err = flux_unalias_pages(ctx, arg);
+		break;
+	case FLUX_DEV_IO_UNALIAS_KERNEL_PAGES:
+		err = flux_unalias_kernel_pages(ctx, arg);
+		break;
+	case FLUX_DEV_IO_REKEY_ALIASES:
+		err = flux_rekey_aliases(arg);
+		break;
+	case FLUX_DEV_IO_FORK_ALIAS_BEGIN:
+		err = flux_fork_alias_begin(ctx, arg);
+		break;
+	case FLUX_DEV_IO_FORK_ALIAS_END:
+		err = flux_fork_alias_end(ctx, arg);
+		break;
+	case FLUX_DEV_IO_GET_BASE_MAPS:
+		err = flux_mm_get_base_maps(ctx, arg);
+		break;
+	case FLUX_DEV_IO_GET_APP_MAPS:
+		err = flux_mm_get_app_maps(ctx, arg);
+		break;
+	case FLUX_DEV_IO_GET_APP_SMAPS:
+		err = flux_mm_get_app_smaps(ctx, arg);
 		break;
 	case FLUX_DEV_IO_ENABLE_MPK:
 		err = flux_mpk_enable(ctx);
@@ -293,14 +353,15 @@ static int __init flux_init(void)
 		goto fail_filter;
 	}
 
-	err = flux_mpk_hook_init();
+	err = flux_uintr_signal_hook_init();
 	if (err) {
-		pr_err("failed to initialize MPK syscall filter: %d\n", err);
-		goto fail_mpk_filter;
+		pr_err("failed to initialize UINTR signal hooks: %d\n", err);
+		goto fail_signal_hook;
 	}
 
 	return 0;
-fail_mpk_filter:
+fail_signal_hook:
+	flux_uintr_signal_hook_exit();
 	flux_mm_hook_exit();
 fail_filter:
 	uintr_exit();
@@ -325,6 +386,7 @@ static void __exit flux_exit(void)
 			  nr_cpu_ids * sizeof(struct flux_shm_percpu));
 
 	flux_mpk_hook_exit();
+	flux_uintr_signal_hook_exit();
 	flux_mm_hook_exit();
 
 	uintr_exit();

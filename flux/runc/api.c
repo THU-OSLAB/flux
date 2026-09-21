@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,8 +12,26 @@
 
 #include "runc.h"
 
+static char flux_runc_error[512];
+
+void flux_runc_set_error(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(flux_runc_error, sizeof(flux_runc_error), fmt, ap);
+	va_end(ap);
+}
+
+const char *flux_runc_last_error(void)
+{
+	return flux_runc_error[0] ? flux_runc_error :
+		       "flux-runc command failed";
+}
+
 void flux_runc_log_errno(const char *what, int err)
 {
+	flux_runc_set_error("%s: %s", what, strerror(-err));
 	FLUX_LOG(FLUX_LOG_ERR, "%s: %s\n", what, strerror(-err));
 }
 
@@ -60,6 +79,7 @@ int flux_runc_create_state(const char *bundle_dir, const char *id,
 
 	ret = flux_launch_ensure_run_cfg_path();
 	if (ret < 0) {
+		flux_runc_set_error("failed to resolve default run cfg path");
 		FLUX_LOG(FLUX_LOG_ERR,
 			 "failed to resolve default run cfg path\n");
 		return ret;
@@ -67,9 +87,14 @@ int flux_runc_create_state(const char *bundle_dir, const char *id,
 
 	run_cfg_path = getenv("FLUX_RUN_CFG_FILE");
 	if (!run_cfg_path || !run_cfg_path[0])
+	{
+		flux_runc_set_error("FLUX_RUN_CFG_FILE is not set");
 		return -EINVAL;
+	}
 
 	if (flux_runc_set_bundle(bundle_dir) < 0) {
+		flux_runc_set_error("failed to resolve container bundle %s",
+				    bundle_dir);
 		FLUX_LOG(FLUX_LOG_ERR,
 			 "failed to resolve container bundle %s\n", bundle_dir);
 		return -EINVAL;
@@ -77,12 +102,15 @@ int flux_runc_create_state(const char *bundle_dir, const char *id,
 
 	ret = flux_runc_load_bundle();
 	if (ret < 0) {
+		flux_runc_set_error("failed to load or validate OCI config in %s",
+				    bundle_dir);
 		FLUX_LOG(FLUX_LOG_ERR, "failed to load container bundle\n");
 		goto out_unload;
 	}
 
 	oci = flux_oci_cfg_get();
 	if (!oci || !oci->bundle_dir) {
+		flux_runc_set_error("OCI bundle state is unavailable");
 		ret = -EINVAL;
 		goto out_unload;
 	}
@@ -100,6 +128,27 @@ int flux_runc_create_state(const char *bundle_dir, const char *id,
 		goto out_remove;
 	}
 
+	ret = flux_runc_state_set_cgroup_path(state, oci->cgroups_path);
+	if (ret < 0) {
+		flux_runc_log_errno("failed to persist cgroup path", ret);
+		goto out_remove;
+	}
+	ret = flux_runc_state_save(state);
+	if (ret < 0) {
+		flux_runc_log_errno("failed to persist cgroup ownership", ret);
+		goto out_remove;
+	}
+	ret = flux_runc_cgroup_create(state);
+	if (ret < 0) {
+		flux_runc_log_errno("failed to create container cgroup", ret);
+		goto out_remove;
+	}
+	ret = flux_runc_cgroup_apply(state, &oci->resources);
+	if (ret < 0) {
+		flux_runc_log_errno("failed to apply container resources", ret);
+		goto out_remove;
+	}
+
 	ret = flux_runc_state_snapshot_bundle_config(state);
 	if (ret < 0) {
 		flux_runc_log_errno("failed to snapshot OCI config", ret);
@@ -109,6 +158,16 @@ int flux_runc_create_state(const char *bundle_dir, const char *id,
 	ret = flux_runc_state_snapshot_run_config(state, run_cfg_path);
 	if (ret < 0) {
 		flux_runc_log_errno("failed to snapshot run cfg", ret);
+		goto out_remove;
+	}
+	ret = flux_runc_resources_apply_run_config(state, &oci->resources);
+	if (ret < 0) {
+		flux_runc_log_errno("failed to translate Flux resources", ret);
+		goto out_remove;
+	}
+	ret = flux_runc_state_save_resources(state, &oci->resources);
+	if (ret < 0) {
+		flux_runc_log_errno("failed to persist container resources", ret);
 		goto out_remove;
 	}
 
@@ -123,6 +182,7 @@ int flux_runc_create_state(const char *bundle_dir, const char *id,
 	return 0;
 
 out_remove:
+	(void)flux_runc_state_cleanup_artifacts(state);
 	(void)flux_runc_state_remove(state);
 	flux_runc_state_fini(state);
 out_unload:
@@ -203,6 +263,7 @@ static void flux_runc_exec_ring_reset(struct flux_exec_ring *ring)
 
 	memset(ring, 0, sizeof(*ring));
 	ring->hdr.size = FLUX_EXEC_RING_SLOTS;
+	ring->hdr.init_status = -1;
 	ring->hdr.next_seq = 1;
 	for (i = 0; i < FLUX_EXEC_RING_SLOTS; i++)
 		ring->slots[i].state = FLUX_EXEC_SLOT_FREE;

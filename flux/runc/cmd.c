@@ -242,6 +242,8 @@ int flux_runc_parse_exec_command(int argc, char **argv,
 		{ "process", required_argument, 0, 'p' },
 		{ "pid-file", required_argument, 0,
 		  FLUX_RUNC_OPT_EXEC_PID_FILE },
+		{ "console-socket", required_argument, 0,
+		  FLUX_RUNC_OPT_CONSOLE_SOCKET },
 		{ "cwd", required_argument, 0, 'c' },
 		{ "env", required_argument, 0, 'e' },
 		{ "user", required_argument, 0, 'u' },
@@ -264,6 +266,9 @@ int flux_runc_parse_exec_command(int argc, char **argv,
 			break;
 		case FLUX_RUNC_OPT_EXEC_PID_FILE:
 			cmd->pid_file = optarg;
+			break;
+		case FLUX_RUNC_OPT_CONSOLE_SOCKET:
+			cmd->console_socket = optarg;
 			break;
 		case 'c':
 			cmd->cwd = optarg;
@@ -333,6 +338,12 @@ int flux_runc_dispatch(int argc, char **argv)
 		return flux_runc_cmd_ps(argc, argv);
 	if (!strcmp(argv[1], "list"))
 		return flux_runc_cmd_list(argc, argv);
+	if (!strcmp(argv[1], "events"))
+		return flux_runc_cmd_events(argc, argv);
+	if (!strcmp(argv[1], "stats"))
+		return flux_runc_cmd_stats(argc, argv);
+	if (!strcmp(argv[1], "update"))
+		return flux_runc_cmd_update(argc, argv);
 
 	return -2;
 }

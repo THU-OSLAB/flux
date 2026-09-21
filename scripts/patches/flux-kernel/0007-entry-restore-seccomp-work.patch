@@ -1,0 +1,27 @@
+From: Flux LTP compatibility work
+Subject: [PATCH] entry: restore configured seccomp syscall work
+
+Restore the native entry filter dispatch where the architecture provides its
+filter interface. Keep configurations without that interface buildable.
+
+--- a/kernel/kernel/entry/common.c
++++ b/kernel/kernel/entry/common.c
+@@ -68,11 +68,13 @@
+ 	}
+ 
+ 	/* Do seccomp after ptrace, to catch any tracer changes. */
+-	// if (work & SYSCALL_WORK_SECCOMP) {
+-	// 	ret = __secure_computing(NULL);
+-	// 	if (ret == -1L)
+-	// 		return ret;
+-	// }
++#ifdef CONFIG_HAVE_ARCH_SECCOMP_FILTER
++	if (work & SYSCALL_WORK_SECCOMP) {
++		ret = __secure_computing(NULL);
++		if (ret == -1L)
++			return ret;
++	}
++#endif
+ 
+ 	/* Either of the above might have changed the syscall number */
+ 	syscall = syscall_get_nr(current, regs);

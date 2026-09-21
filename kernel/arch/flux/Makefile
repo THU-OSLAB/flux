@@ -1,8 +1,19 @@
 # SPDX-License-Identifier: GPL-2.0
 
+# Public Flux ABI headers are shared with the runtime and host module.
+KBUILD_CPPFLAGS += -I$(srctree)/../include
 KBUILD_CFLAGS += -fno-builtin
 
+# Flux uses the x86-64 ABI even though the build ARCH is "flux".  Expose the
+# hardware ABI through uname(2) so userspace feature probes do not treat Flux as
+# an unknown/compat architecture.
+UTS_MACHINE := x86_64
+
 exec_format = $(firstword $(subst -, ,$(CONFIG_OUTPUT_FORMAT)))
+
+# The in-kernel x86-64 module loader handles the standard non-PIC relocation
+# set.  Do not leak the embedded kernel's -fPIC requirement into modules.
+KBUILD_CFLAGS_MODULE += -fno-pic -fno-PIE -mcmodel=large
 
 ifneq (,$(filter elf64 elf32,$(exec_format)))
 KBUILD_CFLAGS += -fPIC

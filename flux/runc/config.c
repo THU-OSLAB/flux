@@ -16,6 +16,9 @@
 #include <utils/jsmn.h>
 
 #define FLUX_OCI_TOKEN_MAX 4096
+#define FLUX_OCI_VERSION_MAJOR 1U
+#define FLUX_OCI_VERSION_MAX_MINOR 3U
+#define FLUX_OCI_VERSION_MAX_PATCH 0U
 
 static struct flux_oci_cfg flux_oci_cfg;
 
@@ -68,8 +71,42 @@ static void flux_oci_free_rlimits(void)
 	flux_oci_cfg.rlimit_num = 0;
 }
 
+static void flux_oci_free_sysctls(void)
+{
+	int i;
+
+	for (i = 0; i < flux_oci_cfg.sysctl_num; i++) {
+		free(flux_oci_cfg.sysctls[i].name);
+		free(flux_oci_cfg.sysctls[i].value);
+	}
+	free(flux_oci_cfg.sysctls);
+	flux_oci_cfg.sysctls = NULL;
+	flux_oci_cfg.sysctl_num = 0;
+}
+
+void flux_oci_resources_fini(struct flux_oci_resources *resources)
+{
+	int i;
+
+	if (!resources)
+		return;
+
+	free(resources->cpu.cpus);
+	free(resources->cpu.mems);
+	free(resources->block_io.weight_devices);
+	free(resources->block_io.throttle_read_bps);
+	free(resources->block_io.throttle_write_bps);
+	free(resources->block_io.throttle_read_iops);
+	free(resources->block_io.throttle_write_iops);
+	for (i = 0; i < resources->network.priority_num; i++)
+		free(resources->network.priorities[i].name);
+	free(resources->network.priorities);
+	memset(resources, 0, sizeof(*resources));
+}
+
 void flux_runc_unload(void)
 {
+	flux_oci_free_string(&flux_oci_cfg.oci_version);
 	flux_oci_free_string(&flux_oci_cfg.bundle_dir);
 	flux_oci_free_string(&flux_oci_cfg.config_path);
 	flux_oci_free_string(&flux_oci_cfg.rootfs_path);
@@ -78,12 +115,21 @@ void flux_runc_unload(void)
 	flux_oci_free_string(&flux_oci_cfg.exec_path);
 	flux_oci_free_string_array(&flux_oci_cfg.argv, &flux_oci_cfg.argc);
 	flux_oci_free_string_array(&flux_oci_cfg.env, &flux_oci_cfg.env_num);
+	free(flux_oci_cfg.user.additional_gids);
+	flux_oci_cfg.user.additional_gids = NULL;
+	flux_oci_cfg.user.additional_gid_num = 0;
 	flux_oci_free_rlimits();
+	free(flux_oci_cfg.device_rules);
+	flux_oci_cfg.device_rules = NULL;
+	flux_oci_cfg.device_rule_num = 0;
+	flux_oci_resources_fini(&flux_oci_cfg.resources);
+	flux_oci_free_sysctls();
 	flux_oci_free_mounts();
 	flux_oci_free_string_array(&flux_oci_cfg.masked_paths,
 				   &flux_oci_cfg.masked_paths_num);
 	flux_oci_free_string_array(&flux_oci_cfg.readonly_paths,
 				   &flux_oci_cfg.readonly_paths_num);
+	flux_oci_free_string(&flux_oci_cfg.cgroups_path);
 	memset(&flux_oci_cfg, 0, sizeof(flux_oci_cfg));
 }
 
@@ -100,24 +146,151 @@ static int flux_oci_strdup(char **dst, const char *src)
 	return 0;
 }
 
+static int flux_oci_hex_digit(char ch)
+{
+	if (ch >= '0' && ch <= '9')
+		return ch - '0';
+	if (ch >= 'a' && ch <= 'f')
+		return ch - 'a' + 10;
+	if (ch >= 'A' && ch <= 'F')
+		return ch - 'A' + 10;
+	return -1;
+}
+
+static int flux_oci_parse_hex4(const char *value, unsigned int *codepoint)
+{
+	unsigned int result = 0;
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		int digit = flux_oci_hex_digit(value[i]);
+
+		if (digit < 0)
+			return -1;
+		result = (result << 4) | (unsigned int)digit;
+	}
+	*codepoint = result;
+	return 0;
+}
+
+static int flux_oci_append_utf8(char *dst, size_t capacity, size_t *offset,
+				unsigned int codepoint)
+{
+	if (codepoint == 0 || codepoint > 0x10ffff ||
+	    (codepoint >= 0xd800 && codepoint <= 0xdfff))
+		return -1;
+	if (codepoint <= 0x7f) {
+		if (*offset + 1 >= capacity)
+			return -1;
+		dst[(*offset)++] = (char)codepoint;
+	} else if (codepoint <= 0x7ff) {
+		if (*offset + 2 >= capacity)
+			return -1;
+		dst[(*offset)++] = (char)(0xc0 | (codepoint >> 6));
+		dst[(*offset)++] = (char)(0x80 | (codepoint & 0x3f));
+	} else if (codepoint <= 0xffff) {
+		if (*offset + 3 >= capacity)
+			return -1;
+		dst[(*offset)++] = (char)(0xe0 | (codepoint >> 12));
+		dst[(*offset)++] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+		dst[(*offset)++] = (char)(0x80 | (codepoint & 0x3f));
+	} else {
+		if (*offset + 4 >= capacity)
+			return -1;
+		dst[(*offset)++] = (char)(0xf0 | (codepoint >> 18));
+		dst[(*offset)++] = (char)(0x80 | ((codepoint >> 12) & 0x3f));
+		dst[(*offset)++] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+		dst[(*offset)++] = (char)(0x80 | (codepoint & 0x3f));
+	}
+	return 0;
+}
+
 static int flux_oci_token_str(const char *json, const jsmntok_t *tok,
 			      char **out)
 {
-	int len;
+	size_t in;
+	size_t len;
+	size_t offset = 0;
 	char *copy;
 
 	if (!tok || !out)
 		return -1;
 
-	len = tok->end - tok->start;
-	copy = malloc((size_t)len + 1);
+	len = (size_t)(tok->end - tok->start);
+	copy = malloc(len + 1);
 	if (!copy)
 		return -1;
 
-	memcpy(copy, json + tok->start, (size_t)len);
-	copy[len] = '\0';
+	for (in = 0; in < len; in++) {
+		char ch = json[tok->start + (int)in];
+
+		if (ch != '\\') {
+			copy[offset++] = ch;
+			continue;
+		}
+		if (++in >= len)
+			goto invalid;
+		ch = json[tok->start + (int)in];
+		switch (ch) {
+		case '"':
+		case '\\':
+		case '/':
+			copy[offset++] = ch;
+			break;
+		case 'b':
+			copy[offset++] = '\b';
+			break;
+		case 'f':
+			copy[offset++] = '\f';
+			break;
+		case 'n':
+			copy[offset++] = '\n';
+			break;
+		case 'r':
+			copy[offset++] = '\r';
+			break;
+		case 't':
+			copy[offset++] = '\t';
+			break;
+		case 'u': {
+			unsigned int codepoint;
+
+			if (in + 4 >= len ||
+			    flux_oci_parse_hex4(json + tok->start + (int)in + 1,
+						&codepoint) < 0)
+				goto invalid;
+			in += 4;
+			if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
+				unsigned int low;
+
+				if (in + 6 >= len ||
+				    json[tok->start + (int)in + 1] != '\\' ||
+				    json[tok->start + (int)in + 2] != 'u' ||
+				    flux_oci_parse_hex4(
+					    json + tok->start + (int)in + 3,
+					    &low) < 0 ||
+				    low < 0xdc00 || low > 0xdfff)
+					goto invalid;
+				codepoint = 0x10000 + ((codepoint - 0xd800) << 10) +
+					    (low - 0xdc00);
+				in += 6;
+			}
+			if (flux_oci_append_utf8(copy, len + 1, &offset,
+						 codepoint) < 0)
+				goto invalid;
+			break;
+		}
+		default:
+			goto invalid;
+		}
+	}
+	copy[offset] = '\0';
 	*out = copy;
 	return 0;
+
+invalid:
+	free(copy);
+	return -1;
 }
 
 static bool flux_oci_token_eq(const char *json, const jsmntok_t *tok,
@@ -153,6 +326,33 @@ static int flux_oci_token_u64(const char *json, const jsmntok_t *tok,
 
 	errno = 0;
 	value = strtoull(buf, &end, 10);
+	if (errno || !end || *end != '\0')
+		return -1;
+
+	*out = value;
+	return 0;
+}
+
+static int flux_oci_token_i64(const char *json, const jsmntok_t *tok,
+			      long long *out)
+{
+	char buf[64];
+	size_t len;
+	char *end = NULL;
+	long long value;
+
+	if (!tok || tok->type != JSMN_PRIMITIVE || !out)
+		return -1;
+
+	len = (size_t)(tok->end - tok->start);
+	if (len >= sizeof(buf))
+		return -1;
+
+	memcpy(buf, json + tok->start, len);
+	buf[len] = '\0';
+
+	errno = 0;
+	value = strtoll(buf, &end, 10);
 	if (errno || !end || *end != '\0')
 		return -1;
 
@@ -209,6 +409,63 @@ static int flux_oci_parse_bool(const char *json, const jsmntok_t *tok,
 	return -1;
 }
 
+static bool flux_oci_token_is_empty(const char *json,
+				    const jsmntok_t *tok)
+{
+	if (!tok)
+		return false;
+
+	if (tok->type == JSMN_ARRAY || tok->type == JSMN_OBJECT)
+		return tok->size == 0;
+	if (tok->type == JSMN_STRING)
+		return tok->start == tok->end;
+	if (tok->type == JSMN_PRIMITIVE && tok->end - tok->start == 4)
+		return strncmp(json + tok->start, "null", 4) == 0;
+
+	return false;
+}
+
+static int flux_oci_reject_nonempty(const char *json, const jsmntok_t *tok,
+				    const char *field)
+{
+	if (flux_oci_token_is_empty(json, tok))
+		return 0;
+
+	FLUX_LOG(FLUX_LOG_ERR, "unsupported OCI field: %s\n", field);
+	return -1;
+}
+
+static int flux_oci_parse_version(const char *json, const jsmntok_t *tok)
+{
+	unsigned int major;
+	unsigned int minor;
+	unsigned int patch;
+	char *version = NULL;
+	char trailing;
+	int parsed;
+
+	if (!tok || tok->type != JSMN_STRING ||
+	    flux_oci_token_str(json, tok, &version) < 0)
+		return -1;
+
+	parsed = sscanf(version, "%u.%u.%u%c", &major, &minor, &patch,
+			&trailing);
+	if (parsed < 3 ||
+	    (parsed == 4 && trailing != '-' && trailing != '+') ||
+	    major != FLUX_OCI_VERSION_MAJOR ||
+	    minor > FLUX_OCI_VERSION_MAX_MINOR ||
+	    (minor == FLUX_OCI_VERSION_MAX_MINOR &&
+	     patch > FLUX_OCI_VERSION_MAX_PATCH)) {
+		FLUX_LOG(FLUX_LOG_ERR, "unsupported OCI version: %s\n", version);
+		free(version);
+		return -1;
+	}
+
+	free(flux_oci_cfg.oci_version);
+	flux_oci_cfg.oci_version = version;
+	return 0;
+}
+
 static int flux_oci_append_string(char ***list, int *count, const char *value)
 {
 	char **new_list;
@@ -218,13 +475,17 @@ static int flux_oci_append_string(char ***list, int *count, const char *value)
 	if (!copy)
 		return -1;
 
-	new_list = realloc(*list, sizeof(*new_list) * (size_t)(*count + 1));
+	/* kernel_execve() consumes argv/envp as NULL-terminated vectors.  Keep
+	 * that invariant after every append instead of relying on allocator
+	 * contents beyond the last element. */
+	new_list = realloc(*list, sizeof(*new_list) * (size_t)(*count + 2));
 	if (!new_list) {
 		free(copy);
 		return -1;
 	}
 
 	new_list[*count] = copy;
+	new_list[*count + 1] = NULL;
 	*list = new_list;
 	(*count)++;
 	return 0;
@@ -384,6 +645,41 @@ static int flux_oci_parse_user(const char *json, const jsmntok_t *tokens,
 				return -1;
 			flux_oci_cfg.user.gid = (gid_t)parsed;
 			flux_oci_cfg.user.has_gid = true;
+		} else if (flux_oci_token_eq(json, &tokens[key],
+					   "additionalGids")) {
+			int j;
+			int gid_tok = value + 1;
+
+			if (tokens[value].type != JSMN_ARRAY)
+				return -1;
+			free(flux_oci_cfg.user.additional_gids);
+			flux_oci_cfg.user.additional_gids = NULL;
+			flux_oci_cfg.user.additional_gid_num = 0;
+			if (tokens[value].size > 0) {
+				flux_oci_cfg.user.additional_gids = calloc(
+					(size_t)tokens[value].size,
+					sizeof(*flux_oci_cfg.user.additional_gids));
+				if (!flux_oci_cfg.user.additional_gids)
+					return -1;
+			}
+			for (j = 0; j < tokens[value].size; j++) {
+				gid_t gid;
+
+				if (flux_oci_token_u64(json, &tokens[gid_tok],
+						       &parsed) < 0)
+					return -1;
+				gid = (gid_t)parsed;
+				if ((unsigned long long)gid != parsed)
+					return -1;
+				flux_oci_cfg.user.additional_gids[j] = gid;
+				flux_oci_cfg.user.additional_gid_num++;
+				gid_tok = flux_oci_token_skip(tokens, gid_tok);
+			}
+		} else if (flux_oci_token_eq(json, &tokens[key], "username")) {
+			if (flux_oci_reject_nonempty(
+				    json, &tokens[value],
+				    "process.user.username") < 0)
+				return -1;
 		}
 
 		tok = flux_oci_token_skip(tokens, value);
@@ -460,6 +756,11 @@ static int flux_oci_parse_capabilities(const char *json,
 				    &flux_oci_cfg.capabilities.inheritable) < 0)
 				return -1;
 			flux_oci_cfg.capabilities.has_inheritable = true;
+		} else if (flux_oci_token_eq(json, &tokens[key], "ambient")) {
+			if (flux_oci_reject_nonempty(
+				    json, &tokens[value],
+				    "process.capabilities.ambient") < 0)
+				return -1;
 		}
 
 		tok = flux_oci_token_skip(tokens, value);
@@ -909,6 +1210,45 @@ static int flux_oci_parse_root(const char *json, const jsmntok_t *tokens,
 	return 0;
 }
 
+static int flux_oci_parse_console_size(const char *json,
+				       const jsmntok_t *tokens, int index)
+{
+	bool width_seen = false;
+	bool height_seen = false;
+	int tok = index + 1;
+	int i;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -1;
+
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+		unsigned long long parsed;
+
+		if (flux_oci_token_eq(json, &tokens[key], "width")) {
+			if (flux_oci_token_u64(json, &tokens[value], &parsed) < 0 ||
+			    parsed > USHRT_MAX)
+				return -1;
+			flux_oci_cfg.console_width = (unsigned int)parsed;
+			width_seen = true;
+		} else if (flux_oci_token_eq(json, &tokens[key], "height")) {
+			if (flux_oci_token_u64(json, &tokens[value], &parsed) < 0 ||
+			    parsed > USHRT_MAX)
+				return -1;
+			flux_oci_cfg.console_height = (unsigned int)parsed;
+			height_seen = true;
+		}
+
+		tok = flux_oci_token_skip(tokens, value);
+	}
+
+	if (!width_seen || !height_seen)
+		return -1;
+	flux_oci_cfg.has_console_size = true;
+	return 0;
+}
+
 static int flux_oci_parse_process(const char *json, const jsmntok_t *tokens,
 				  int index)
 {
@@ -983,6 +1323,55 @@ static int flux_oci_parse_process(const char *json, const jsmntok_t *tokens,
 					 "OCI parse_process failed on terminal\n");
 				return -1;
 			}
+		} else if (flux_oci_token_eq(json, &tokens[key],
+					   "apparmorProfile")) {
+			char *profile = NULL;
+
+			if (tokens[value].type != JSMN_STRING ||
+			    flux_oci_token_str(json, &tokens[value], &profile) < 0)
+				return -1;
+			if (profile[0] && strcmp(profile, "unconfined")) {
+				FLUX_LOG(FLUX_LOG_ERR,
+					 "unsupported OCI field: process.apparmorProfile=%s\n",
+					 profile);
+				free(profile);
+				return -1;
+			}
+			free(profile);
+		} else if (flux_oci_token_eq(json, &tokens[key], "selinuxLabel")) {
+			if (flux_oci_reject_nonempty(
+				    json, &tokens[value],
+				    "process.selinuxLabel") < 0)
+				return -1;
+		} else if (flux_oci_token_eq(json, &tokens[key], "oomScoreAdj")) {
+			long long adjustment;
+
+			if (flux_oci_token_i64(json, &tokens[value], &adjustment) < 0)
+				return -1;
+			if (adjustment != 0) {
+				FLUX_LOG(FLUX_LOG_ERR,
+					 "unsupported OCI field: process.oomScoreAdj=%lld\n",
+					 adjustment);
+				return -1;
+			}
+		} else if (flux_oci_token_eq(json, &tokens[key], "consoleSize")) {
+			if (flux_oci_parse_console_size(json, tokens, value) < 0) {
+				FLUX_LOG(FLUX_LOG_ERR,
+					 "OCI parse_process failed on consoleSize\n");
+				return -1;
+			}
+		} else if (flux_oci_token_eq(json, &tokens[key], "scheduler") ||
+			   flux_oci_token_eq(json, &tokens[key], "ioPriority") ||
+			   flux_oci_token_eq(json, &tokens[key], "execCPUAffinity") ||
+			   flux_oci_token_eq(json, &tokens[key], "umask")) {
+			char *field = NULL;
+
+			if (flux_oci_token_str(json, &tokens[key], &field) < 0)
+				return -1;
+			FLUX_LOG(FLUX_LOG_ERR, "unsupported OCI field: process.%s\n",
+				 field);
+			free(field);
+			return -1;
 		}
 
 		tok = flux_oci_token_skip(tokens, value);
@@ -1062,6 +1451,997 @@ static int flux_oci_parse_mounts(const char *json, const jsmntok_t *tokens,
 	return 0;
 }
 
+struct flux_oci_namespace_name_map {
+	const char *name;
+	unsigned int flag;
+};
+
+static const struct flux_oci_namespace_name_map flux_oci_namespace_names[] = {
+	{ "pid", FLUX_OCI_NS_PID },
+	{ "ipc", FLUX_OCI_NS_IPC },
+	{ "uts", FLUX_OCI_NS_UTS },
+	{ "mount", FLUX_OCI_NS_MOUNT },
+	{ "network", FLUX_OCI_NS_NETWORK },
+	{ "cgroup", FLUX_OCI_NS_CGROUP },
+	{ "time", FLUX_OCI_NS_TIME },
+};
+
+static int flux_oci_namespace_flag(const char *name, unsigned int *flag)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(flux_oci_namespace_names) /
+			       sizeof(flux_oci_namespace_names[0]);
+	     i++) {
+		if (!strcmp(name, flux_oci_namespace_names[i].name)) {
+			*flag = flux_oci_namespace_names[i].flag;
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+static int flux_oci_parse_namespace(const char *json,
+				    const jsmntok_t *tokens, int index)
+{
+	char *type = NULL;
+	unsigned int flag;
+	int i;
+	int tok = index + 1;
+	int ret = -1;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -1;
+
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+
+		if (flux_oci_token_eq(json, &tokens[key], "type")) {
+			if (tokens[value].type != JSMN_STRING ||
+			    flux_oci_token_str(json, &tokens[value], &type) < 0)
+				goto out;
+		} else if (flux_oci_token_eq(json, &tokens[key], "path")) {
+			if (flux_oci_reject_nonempty(
+				    json, &tokens[value],
+				    "linux.namespaces[].path") < 0)
+				goto out;
+		}
+
+		tok = flux_oci_token_skip(tokens, value);
+	}
+
+	if (!type) {
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "missing required OCI field: linux.namespaces[].type\n");
+		goto out;
+	}
+
+	/* Each Flux instance already owns its LibOS PID, IPC, UTS, mount,
+	 * network, cgroup and clock views. Joining host namespaces, user-id
+	 * mappings and nonzero time offsets need different mechanisms. */
+	if (flux_oci_namespace_flag(type, &flag) < 0) {
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "unsupported OCI namespace type: %s\n", type);
+		goto out;
+	}
+	if (flux_oci_cfg.namespace_flags & flag) {
+		FLUX_LOG(FLUX_LOG_ERR, "duplicate OCI namespace type: %s\n",
+			 type);
+		goto out;
+	}
+
+	flux_oci_cfg.namespace_flags |= flag;
+	ret = 0;
+out:
+	free(type);
+	return ret;
+}
+
+static int flux_oci_parse_namespaces(const char *json,
+				     const jsmntok_t *tokens, int index)
+{
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_ARRAY)
+		return -1;
+
+	for (i = 0; i < tokens[index].size; i++) {
+		if (flux_oci_parse_namespace(json, tokens, tok) < 0)
+			return -1;
+		tok = flux_oci_token_skip(tokens, tok);
+	}
+
+	return 0;
+}
+
+static int flux_oci_parse_device_access(const char *json,
+					const jsmntok_t *tok,
+					unsigned int *access)
+{
+	char *value = NULL;
+	const char *p;
+
+	if (!tok || tok->type != JSMN_STRING ||
+	    flux_oci_token_str(json, tok, &value) < 0)
+		return -1;
+	if (!value[0]) {
+		free(value);
+		return -1;
+	}
+
+	*access = 0;
+	for (p = value; *p; p++) {
+		switch (*p) {
+		case 'r':
+			*access |= FLUX_OCI_DEVICE_READ;
+			break;
+		case 'w':
+			*access |= FLUX_OCI_DEVICE_WRITE;
+			break;
+		case 'm':
+			*access |= FLUX_OCI_DEVICE_MKNOD;
+			break;
+		default:
+			free(value);
+			return -1;
+		}
+	}
+
+	free(value);
+	return 0;
+}
+
+static int flux_oci_parse_device_rule(const char *json,
+				      const jsmntok_t *tokens, int index,
+				      struct flux_oci_device_rule *rule)
+{
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -1;
+
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+
+		if (flux_oci_token_eq(json, &tokens[key], "allow")) {
+			if (flux_oci_parse_bool(json, &tokens[value],
+						&rule->allow) < 0)
+				return -1;
+			rule->has_allow = true;
+		} else if (flux_oci_token_eq(json, &tokens[key], "type")) {
+			char *type = NULL;
+
+			if (tokens[value].type != JSMN_STRING ||
+			    flux_oci_token_str(json, &tokens[value], &type) < 0)
+				return -1;
+			if (strlen(type) != 1 ||
+			    (type[0] != 'a' && type[0] != 'b' && type[0] != 'c')) {
+				free(type);
+				return -1;
+			}
+			rule->type = type[0];
+			free(type);
+		} else if (flux_oci_token_eq(json, &tokens[key], "major") ||
+			   flux_oci_token_eq(json, &tokens[key], "minor")) {
+			long long number;
+			long long *dst;
+			bool *has;
+
+			if (flux_oci_token_is_empty(json, &tokens[value])) {
+				tok = flux_oci_token_skip(tokens, value);
+				continue;
+			}
+			if (flux_oci_token_i64(json, &tokens[value], &number) < 0 ||
+			    number < -1)
+				return -1;
+			dst = flux_oci_token_eq(json, &tokens[key], "major") ?
+				      &rule->major : &rule->minor;
+			has = flux_oci_token_eq(json, &tokens[key], "major") ?
+				      &rule->has_major : &rule->has_minor;
+			*dst = number;
+			*has = number >= 0;
+		} else if (flux_oci_token_eq(json, &tokens[key], "access")) {
+			if (flux_oci_parse_device_access(
+				    json, &tokens[value], &rule->access) < 0)
+				return -1;
+		}
+
+		tok = flux_oci_token_skip(tokens, value);
+	}
+
+	if (!rule->has_allow || !rule->access)
+		return -1;
+
+	return 0;
+}
+
+static int flux_oci_parse_device_rules(const char *json,
+				       const jsmntok_t *tokens, int index)
+{
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_ARRAY)
+		return -1;
+
+	free(flux_oci_cfg.device_rules);
+	flux_oci_cfg.device_rules = NULL;
+	flux_oci_cfg.device_rule_num = 0;
+	if (tokens[index].size > 0) {
+		flux_oci_cfg.device_rules = calloc(
+			(size_t)tokens[index].size,
+			sizeof(*flux_oci_cfg.device_rules));
+		if (!flux_oci_cfg.device_rules)
+			return -1;
+	}
+
+	for (i = 0; i < tokens[index].size; i++) {
+		if (flux_oci_parse_device_rule(
+			    json, tokens, tok, &flux_oci_cfg.device_rules[i]) < 0)
+			return -1;
+		flux_oci_cfg.device_rule_num++;
+		tok = flux_oci_token_skip(tokens, tok);
+	}
+
+	return 0;
+}
+
+bool flux_oci_device_allowed(const struct flux_oci_cfg *oci, char type,
+			     unsigned int major, unsigned int minor,
+			     unsigned int access)
+{
+	unsigned int bit;
+	int i;
+
+	if (!oci || oci->device_rule_num == 0)
+		return true;
+
+	for (bit = FLUX_OCI_DEVICE_READ; bit <= FLUX_OCI_DEVICE_MKNOD;
+	     bit <<= 1) {
+		bool allowed = true;
+
+		if (!(access & bit))
+			continue;
+		for (i = 0; i < oci->device_rule_num; i++) {
+			const struct flux_oci_device_rule *rule =
+				&oci->device_rules[i];
+
+			if (rule->type && rule->type != 'a' &&
+			    rule->type != type)
+				continue;
+			if (rule->has_major && rule->major != (long long)major)
+				continue;
+			if (rule->has_minor && rule->minor != (long long)minor)
+				continue;
+			if (rule->access & bit)
+				allowed = rule->allow;
+		}
+		if (!allowed)
+			return false;
+	}
+
+	return true;
+}
+
+static int flux_oci_parse_memory_resource(
+	const char *json, const jsmntok_t *tokens, int index,
+	struct flux_oci_memory_resources *memory)
+{
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -1;
+
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+
+		if (flux_oci_token_eq(json, &tokens[key], "limit") ||
+		    flux_oci_token_eq(json, &tokens[key], "reservation") ||
+		    flux_oci_token_eq(json, &tokens[key], "swap")) {
+			long long number;
+			int64_t *dst;
+			bool *has;
+
+			if (flux_oci_token_i64(json, &tokens[value], &number) < 0 ||
+			    number < -1)
+				return -1;
+			if (flux_oci_token_eq(json, &tokens[key], "limit")) {
+				dst = &memory->limit;
+				has = &memory->has_limit;
+			} else if (flux_oci_token_eq(json, &tokens[key],
+						       "reservation")) {
+				dst = &memory->reservation;
+				has = &memory->has_reservation;
+			} else {
+				dst = &memory->swap;
+				has = &memory->has_swap;
+			}
+			*dst = (int64_t)number;
+			*has = true;
+		} else if (flux_oci_token_eq(json, &tokens[key], "swappiness")) {
+			unsigned long long number;
+
+			if (flux_oci_token_u64(json, &tokens[value], &number) < 0 ||
+			    number > 100)
+				return -1;
+			memory->swappiness = (uint64_t)number;
+			memory->has_swappiness = true;
+		} else if (flux_oci_token_eq(json, &tokens[key],
+						      "disableOOMKiller") ||
+			   flux_oci_token_eq(json, &tokens[key], "useHierarchy") ||
+			   flux_oci_token_eq(json, &tokens[key],
+						      "checkBeforeUpdate")) {
+			bool setting;
+			bool *dst;
+			bool *has;
+
+			if (flux_oci_parse_bool(json, &tokens[value], &setting) < 0)
+				return -1;
+			if (flux_oci_token_eq(json, &tokens[key],
+						 "disableOOMKiller")) {
+				dst = &memory->disable_oom_killer;
+				has = &memory->has_disable_oom_killer;
+			} else if (flux_oci_token_eq(json, &tokens[key],
+							"useHierarchy")) {
+				dst = &memory->use_hierarchy;
+				has = &memory->has_use_hierarchy;
+			} else {
+				dst = &memory->check_before_update;
+				has = &memory->has_check_before_update;
+			}
+			*dst = setting;
+			*has = true;
+		} else {
+			char *field = NULL;
+			char scoped[192];
+			int ret;
+
+			if (flux_oci_token_str(json, &tokens[key], &field) < 0)
+				return -1;
+			if (snprintf(scoped, sizeof(scoped),
+				     "linux.resources.memory.%s", field) >=
+			    (int)sizeof(scoped)) {
+				free(field);
+				return -1;
+			}
+			ret = flux_oci_reject_nonempty(json, &tokens[value], scoped);
+			free(field);
+			if (ret < 0)
+				return -1;
+		}
+
+		tok = flux_oci_token_skip(tokens, value);
+	}
+
+	return 0;
+}
+
+static int flux_oci_parse_cpu_resource(const char *json,
+				       const jsmntok_t *tokens, int index,
+				       struct flux_oci_cpu_resources *cpu)
+{
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -1;
+
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+
+		if (flux_oci_token_eq(json, &tokens[key], "shares") ||
+		    flux_oci_token_eq(json, &tokens[key], "period") ||
+		    flux_oci_token_eq(json, &tokens[key], "burst") ||
+		    flux_oci_token_eq(json, &tokens[key], "realtimePeriod")) {
+			unsigned long long number;
+			uint64_t *dst;
+			bool *has;
+
+			if (flux_oci_token_u64(json, &tokens[value], &number) < 0)
+				return -1;
+			if (flux_oci_token_eq(json, &tokens[key], "shares")) {
+				if (number != 0 && (number < 2 || number > 262144))
+					return -1;
+				dst = &cpu->shares;
+				has = &cpu->has_shares;
+			} else if (flux_oci_token_eq(json, &tokens[key], "period")) {
+				dst = &cpu->period;
+				has = &cpu->has_period;
+			} else if (flux_oci_token_eq(json, &tokens[key], "burst")) {
+				dst = &cpu->burst;
+				has = &cpu->has_burst;
+			} else {
+				dst = &cpu->realtime_period;
+				has = &cpu->has_realtime_period;
+			}
+			*dst = (uint64_t)number;
+			*has = true;
+		} else if (flux_oci_token_eq(json, &tokens[key], "quota") ||
+			   flux_oci_token_eq(json, &tokens[key],
+						      "realtimeRuntime") ||
+			   flux_oci_token_eq(json, &tokens[key], "idle")) {
+			long long number;
+			int64_t *dst;
+			bool *has;
+
+			if (flux_oci_token_i64(json, &tokens[value], &number) < 0 ||
+			    number < -1)
+				return -1;
+			if (flux_oci_token_eq(json, &tokens[key], "quota")) {
+				dst = &cpu->quota;
+				has = &cpu->has_quota;
+			} else if (flux_oci_token_eq(json, &tokens[key],
+							"realtimeRuntime")) {
+				dst = &cpu->realtime_runtime;
+				has = &cpu->has_realtime_runtime;
+			} else {
+				if (number != 0 && number != 1)
+					return -1;
+				dst = &cpu->idle;
+				has = &cpu->has_idle;
+			}
+			*dst = (int64_t)number;
+			*has = true;
+		} else if (flux_oci_token_eq(json, &tokens[key], "cpus") ||
+			   flux_oci_token_eq(json, &tokens[key], "mems")) {
+			bool is_cpus = flux_oci_token_eq(json, &tokens[key], "cpus");
+			char **dst = is_cpus ? &cpu->cpus : &cpu->mems;
+
+			if (tokens[value].type != JSMN_STRING ||
+			    flux_oci_token_str(json, &tokens[value], dst) < 0)
+				return -1;
+			if (is_cpus)
+				cpu->has_cpus = true;
+			else
+				cpu->has_mems = true;
+		} else {
+			char *field = NULL;
+			char scoped[160];
+			int ret;
+
+			if (flux_oci_token_str(json, &tokens[key], &field) < 0)
+				return -1;
+			ret = snprintf(scoped, sizeof(scoped),
+				       "linux.resources.cpu.%s", field);
+			free(field);
+			if (ret < 0 || ret >= (int)sizeof(scoped) ||
+			    flux_oci_reject_nonempty(json, &tokens[value], scoped) < 0)
+				return -1;
+		}
+		tok = flux_oci_token_skip(tokens, value);
+	}
+
+	if (cpu->has_quota && cpu->quota > 0 && cpu->has_burst &&
+	    cpu->burst > (uint64_t)cpu->quota)
+		return -1;
+	return 0;
+}
+
+static int flux_oci_parse_pids_resource(const char *json,
+					const jsmntok_t *tokens, int index,
+					struct flux_oci_pids_resources *pids)
+{
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -1;
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+
+		if (flux_oci_token_eq(json, &tokens[key], "limit")) {
+			long long number;
+
+			if (flux_oci_token_i64(json, &tokens[value], &number) < 0 ||
+			    number < -1)
+				return -1;
+			pids->limit = (int64_t)number;
+			pids->has_limit = true;
+		} else {
+			return -1;
+		}
+		tok = flux_oci_token_skip(tokens, value);
+	}
+	return pids->has_limit ? 0 : -1;
+}
+
+static int flux_oci_parse_block_io_throttle(
+	const char *json, const jsmntok_t *tokens, int index,
+	struct flux_oci_block_io_throttle *throttle)
+{
+	bool has_major = false;
+	bool has_minor = false;
+	bool has_rate = false;
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -1;
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+
+		if (flux_oci_token_eq(json, &tokens[key], "major") ||
+		    flux_oci_token_eq(json, &tokens[key], "minor")) {
+			long long number;
+			if (flux_oci_token_i64(json, &tokens[value], &number) < 0 ||
+			    number < 0)
+				return -1;
+			if (flux_oci_token_eq(json, &tokens[key], "major")) {
+				throttle->major = (int64_t)number;
+				has_major = true;
+			} else {
+				throttle->minor = (int64_t)number;
+				has_minor = true;
+			}
+		} else if (flux_oci_token_eq(json, &tokens[key], "rate")) {
+			unsigned long long number;
+			if (flux_oci_token_u64(json, &tokens[value], &number) < 0 ||
+			    number == 0)
+				return -1;
+			throttle->rate = (uint64_t)number;
+			has_rate = true;
+		} else {
+			return -1;
+		}
+		tok = flux_oci_token_skip(tokens, value);
+	}
+	return has_major && has_minor && has_rate ? 0 : -1;
+}
+
+static int flux_oci_parse_block_io_throttles(
+	const char *json, const jsmntok_t *tokens, int index,
+	struct flux_oci_block_io_throttle **items, int *count)
+{
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_ARRAY)
+		return -1;
+	free(*items);
+	*items = NULL;
+	*count = 0;
+	if (tokens[index].size > 0) {
+		*items = calloc((size_t)tokens[index].size, sizeof(**items));
+		if (!*items)
+			return -1;
+	}
+	for (i = 0; i < tokens[index].size; i++) {
+		if (flux_oci_parse_block_io_throttle(json, tokens, tok,
+						     &(*items)[i]) < 0)
+			return -1;
+		(*count)++;
+		tok = flux_oci_token_skip(tokens, tok);
+	}
+	return 0;
+}
+
+static int flux_oci_parse_block_io_weight_device(
+	const char *json, const jsmntok_t *tokens, int index,
+	struct flux_oci_block_io_weight_device *device)
+{
+	bool has_major = false;
+	bool has_minor = false;
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -1;
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+
+		if (flux_oci_token_eq(json, &tokens[key], "major") ||
+		    flux_oci_token_eq(json, &tokens[key], "minor")) {
+			long long number;
+			if (flux_oci_token_i64(json, &tokens[value], &number) < 0 ||
+			    number < 0)
+				return -1;
+			if (flux_oci_token_eq(json, &tokens[key], "major")) {
+				device->major = (int64_t)number;
+				has_major = true;
+			} else {
+				device->minor = (int64_t)number;
+				has_minor = true;
+			}
+		} else if (flux_oci_token_eq(json, &tokens[key], "weight") ||
+			   flux_oci_token_eq(json, &tokens[key], "leafWeight")) {
+			unsigned long long number;
+			uint16_t *dst;
+			bool *has;
+
+			if (flux_oci_token_u64(json, &tokens[value], &number) < 0 ||
+			    (number != 0 && (number < 10 || number > 1000)))
+				return -1;
+			if (flux_oci_token_eq(json, &tokens[key], "weight")) {
+				dst = &device->weight;
+				has = &device->has_weight;
+			} else {
+				dst = &device->leaf_weight;
+				has = &device->has_leaf_weight;
+			}
+			*dst = (uint16_t)number;
+			*has = true;
+		} else {
+			return -1;
+		}
+		tok = flux_oci_token_skip(tokens, value);
+	}
+	return has_major && has_minor &&
+	       (device->has_weight || device->has_leaf_weight) ? 0 : -1;
+}
+
+static int flux_oci_parse_block_io_resource(
+	const char *json, const jsmntok_t *tokens, int index,
+	struct flux_oci_block_io_resources *block_io)
+{
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -1;
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+
+		if (flux_oci_token_eq(json, &tokens[key], "weight") ||
+		    flux_oci_token_eq(json, &tokens[key], "leafWeight")) {
+			unsigned long long number;
+			uint16_t *dst;
+			bool *has;
+
+			if (flux_oci_token_u64(json, &tokens[value], &number) < 0 ||
+			    (number != 0 && (number < 10 || number > 1000)))
+				return -1;
+			if (flux_oci_token_eq(json, &tokens[key], "weight")) {
+				dst = &block_io->weight;
+				has = &block_io->has_weight;
+			} else {
+				dst = &block_io->leaf_weight;
+				has = &block_io->has_leaf_weight;
+			}
+			*dst = (uint16_t)number;
+			*has = true;
+		} else if (flux_oci_token_eq(json, &tokens[key], "weightDevice")) {
+			int j;
+			int item = value + 1;
+			if (tokens[value].type != JSMN_ARRAY)
+				return -1;
+			free(block_io->weight_devices);
+			block_io->weight_devices = calloc(
+				(size_t)tokens[value].size,
+				sizeof(*block_io->weight_devices));
+			if (tokens[value].size > 0 && !block_io->weight_devices)
+				return -1;
+			block_io->weight_device_num = 0;
+			for (j = 0; j < tokens[value].size; j++) {
+				if (flux_oci_parse_block_io_weight_device(
+					    json, tokens, item,
+					    &block_io->weight_devices[j]) < 0)
+					return -1;
+				block_io->weight_device_num++;
+				item = flux_oci_token_skip(tokens, item);
+			}
+		} else if (flux_oci_token_eq(json, &tokens[key],
+						      "throttleReadBpsDevice")) {
+			if (flux_oci_parse_block_io_throttles(
+				    json, tokens, value, &block_io->throttle_read_bps,
+				    &block_io->throttle_read_bps_num) < 0)
+				return -1;
+		} else if (flux_oci_token_eq(json, &tokens[key],
+						      "throttleWriteBpsDevice")) {
+			if (flux_oci_parse_block_io_throttles(
+				    json, tokens, value, &block_io->throttle_write_bps,
+				    &block_io->throttle_write_bps_num) < 0)
+				return -1;
+		} else if (flux_oci_token_eq(json, &tokens[key],
+						      "throttleReadIOPSDevice")) {
+			if (flux_oci_parse_block_io_throttles(
+				    json, tokens, value, &block_io->throttle_read_iops,
+				    &block_io->throttle_read_iops_num) < 0)
+				return -1;
+		} else if (flux_oci_token_eq(json, &tokens[key],
+						      "throttleWriteIOPSDevice")) {
+			if (flux_oci_parse_block_io_throttles(
+				    json, tokens, value, &block_io->throttle_write_iops,
+				    &block_io->throttle_write_iops_num) < 0)
+				return -1;
+		} else {
+			return -1;
+		}
+		tok = flux_oci_token_skip(tokens, value);
+	}
+	return 0;
+}
+
+static int flux_oci_parse_network_resource(
+	const char *json, const jsmntok_t *tokens, int index,
+	struct flux_oci_network_resources *network)
+{
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -1;
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+
+		if (flux_oci_token_eq(json, &tokens[key], "classID")) {
+			unsigned long long number;
+			if (flux_oci_token_u64(json, &tokens[value], &number) < 0 ||
+			    number > UINT32_MAX)
+				return -1;
+			network->class_id = (uint32_t)number;
+			network->has_class_id = true;
+		} else if (flux_oci_token_eq(json, &tokens[key], "priorities")) {
+			int j;
+			int item = value + 1;
+			if (tokens[value].type != JSMN_ARRAY)
+				return -1;
+			network->priorities = calloc(
+				(size_t)tokens[value].size,
+				sizeof(*network->priorities));
+			if (tokens[value].size > 0 && !network->priorities)
+				return -1;
+			for (j = 0; j < tokens[value].size; j++) {
+				struct flux_oci_network_priority *priority =
+					&network->priorities[j];
+				bool has_name = false;
+				bool has_priority = false;
+				int k;
+				int field = item + 1;
+
+				if (tokens[item].type != JSMN_OBJECT)
+					return -1;
+				for (k = 0; k < tokens[item].size; k++) {
+					int field_value = field + 1;
+					if (flux_oci_token_eq(json, &tokens[field],
+							      "name")) {
+						if (tokens[field_value].type != JSMN_STRING ||
+						    flux_oci_token_str(json,
+							&tokens[field_value],
+							&priority->name) < 0)
+							return -1;
+						has_name = priority->name[0] != '\0';
+					} else if (flux_oci_token_eq(
+							   json, &tokens[field],
+							   "priority")) {
+						unsigned long long number;
+						if (flux_oci_token_u64(
+							    json, &tokens[field_value],
+							    &number) < 0 ||
+						    number > UINT32_MAX)
+							return -1;
+						priority->priority = (uint32_t)number;
+						has_priority = true;
+					} else {
+						return -1;
+					}
+					field = flux_oci_token_skip(tokens, field_value);
+				}
+				if (!has_name || !has_priority)
+					return -1;
+				network->priority_num++;
+				item = flux_oci_token_skip(tokens, item);
+			}
+		} else {
+			return -1;
+		}
+		tok = flux_oci_token_skip(tokens, value);
+	}
+	return 0;
+}
+
+static int flux_oci_parse_resources(const char *json,
+				    const jsmntok_t *tokens, int index,
+				    struct flux_oci_resources *resources)
+{
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -1;
+
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+
+		if (flux_oci_token_eq(json, &tokens[key], "devices")) {
+			if (flux_oci_parse_device_rules(json, tokens, value) < 0)
+				return -1;
+		} else if (flux_oci_token_eq(json, &tokens[key], "memory")) {
+			if (flux_oci_parse_memory_resource(
+				    json, tokens, value, &resources->memory) < 0)
+				return -1;
+			resources->has_memory = true;
+		} else if (flux_oci_token_eq(json, &tokens[key], "cpu")) {
+			if (flux_oci_parse_cpu_resource(json, tokens, value,
+						&resources->cpu) < 0)
+				return -1;
+			resources->has_cpu = true;
+		} else if (flux_oci_token_eq(json, &tokens[key], "pids")) {
+			if (flux_oci_parse_pids_resource(json, tokens, value,
+						 &resources->pids) < 0)
+				return -1;
+			resources->has_pids = true;
+		} else if (flux_oci_token_eq(json, &tokens[key], "blockIO")) {
+			if (flux_oci_parse_block_io_resource(
+				    json, tokens, value, &resources->block_io) < 0)
+				return -1;
+			resources->has_block_io = true;
+		} else if (flux_oci_token_eq(json, &tokens[key], "network")) {
+			if (flux_oci_parse_network_resource(
+				    json, tokens, value, &resources->network) < 0)
+				return -1;
+			resources->has_network = true;
+		} else {
+			char *field = NULL;
+			char scoped[160];
+			int ret;
+
+			if (flux_oci_token_str(json, &tokens[key], &field) < 0)
+				return -1;
+			if (snprintf(scoped, sizeof(scoped),
+				     "linux.resources.%s", field) >=
+			    (int)sizeof(scoped)) {
+				free(field);
+				return -1;
+			}
+			ret = flux_oci_reject_nonempty(json, &tokens[value], scoped);
+			free(field);
+			if (ret < 0)
+				return -1;
+		}
+
+		tok = flux_oci_token_skip(tokens, value);
+	}
+
+	return 0;
+}
+
+int flux_oci_resources_parse_json(const char *json,
+				  struct flux_oci_resources *resources)
+{
+	struct flux_oci_resources parsed = { 0 };
+	jsmn_parser parser;
+	jsmntok_t *tokens;
+	int token_count;
+	int ret = -1;
+
+	if (!json || !resources)
+		return -EINVAL;
+	tokens = calloc(FLUX_OCI_TOKEN_MAX, sizeof(*tokens));
+	if (!tokens)
+		return -ENOMEM;
+	jsmn_init(&parser);
+	token_count = jsmn_parse(&parser, json, strlen(json), tokens,
+				 FLUX_OCI_TOKEN_MAX);
+	if (token_count < 1 || tokens[0].type != JSMN_OBJECT)
+		goto out;
+	if (flux_oci_parse_resources(json, tokens, 0, &parsed) < 0)
+		goto out;
+
+	flux_oci_resources_fini(resources);
+	*resources = parsed;
+	memset(&parsed, 0, sizeof(parsed));
+	ret = 0;
+out:
+	flux_oci_resources_fini(&parsed);
+	free(tokens);
+	return ret;
+}
+
+static int flux_oci_parse_cgroups_path(const char *json,
+				       const jsmntok_t *tok)
+{
+	char *path = NULL;
+	const char *component;
+
+	if (!tok || tok->type != JSMN_STRING ||
+	    flux_oci_token_str(json, tok, &path) < 0)
+		return -1;
+	if (!path[0]) {
+		free(path);
+		return 0;
+	}
+	if (path[0] != '/' || !path[1] || path[strlen(path) - 1] == '/')
+		goto invalid;
+
+	component = path + 1;
+	while (*component) {
+		const char *slash = strchr(component, '/');
+		size_t len = slash ? (size_t)(slash - component) :
+				     strlen(component);
+
+		if (len == 0 || (len == 1 && component[0] == '.') ||
+		    (len == 2 && component[0] == '.' && component[1] == '.'))
+			goto invalid;
+		component = slash ? slash + 1 : component + len;
+	}
+
+	free(flux_oci_cfg.cgroups_path);
+	flux_oci_cfg.cgroups_path = path;
+	return 0;
+
+invalid:
+	FLUX_LOG(FLUX_LOG_ERR,
+		 "unsupported OCI cgroupsPath (absolute cgroupfs path required): %s\n",
+		 path);
+	free(path);
+	return -1;
+}
+
+static bool flux_oci_sysctl_name_valid(const char *name)
+{
+	const unsigned char *p = (const unsigned char *)name;
+
+	if (!name || !name[0] || name[0] == '.' ||
+	    name[strlen(name) - 1] == '.')
+		return false;
+	for (; *p; p++) {
+		if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+		    (*p >= '0' && *p <= '9') || *p == '_' || *p == '-' ||
+		    *p == '.')
+			continue;
+		return false;
+	}
+	return strstr(name, "..") == NULL;
+}
+
+static int flux_oci_parse_sysctls(const char *json,
+				  const jsmntok_t *tokens, int index)
+{
+	int i;
+	int tok = index + 1;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -1;
+
+	flux_oci_free_sysctls();
+	if (tokens[index].size > 0) {
+		flux_oci_cfg.sysctls = calloc((size_t)tokens[index].size,
+					       sizeof(*flux_oci_cfg.sysctls));
+		if (!flux_oci_cfg.sysctls)
+			return -1;
+	}
+
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+		int j;
+
+		flux_oci_cfg.sysctl_num = i + 1;
+		if (tokens[key].type != JSMN_STRING ||
+		    tokens[value].type != JSMN_STRING ||
+		    flux_oci_token_str(json, &tokens[key],
+				       &flux_oci_cfg.sysctls[i].name) < 0 ||
+		    flux_oci_token_str(json, &tokens[value],
+				       &flux_oci_cfg.sysctls[i].value) < 0)
+			return -1;
+		if (!flux_oci_sysctl_name_valid(flux_oci_cfg.sysctls[i].name))
+			return -1;
+		for (j = 0; j < i; j++) {
+			if (!strcmp(flux_oci_cfg.sysctls[j].name,
+				    flux_oci_cfg.sysctls[i].name))
+				return -1;
+		}
+
+		tok = flux_oci_token_skip(tokens, value);
+	}
+
+	return 0;
+}
+
 static int flux_oci_parse_linux(const char *json, const jsmntok_t *tokens,
 				int index)
 {
@@ -1085,7 +2465,42 @@ static int flux_oci_parse_linux(const char *json, const jsmntok_t *tokens,
 			if (flux_oci_parse_string_array(
 				    json, tokens, value,
 				    &flux_oci_cfg.readonly_paths,
-				    &flux_oci_cfg.readonly_paths_num) < 0)
+					    &flux_oci_cfg.readonly_paths_num) < 0)
+				return -1;
+		} else if (flux_oci_token_eq(json, &tokens[key], "namespaces")) {
+			if (flux_oci_parse_namespaces(json, tokens, value) < 0)
+				return -1;
+		} else if (flux_oci_token_eq(json, &tokens[key], "resources")) {
+			if (flux_oci_parse_resources(json, tokens, value,
+						&flux_oci_cfg.resources) < 0)
+				return -1;
+		} else if (flux_oci_token_eq(json, &tokens[key], "cgroupsPath")) {
+			if (flux_oci_parse_cgroups_path(json, &tokens[value]) < 0)
+				return -1;
+		} else if (flux_oci_token_eq(json, &tokens[key], "sysctl")) {
+			if (flux_oci_parse_sysctls(json, tokens, value) < 0)
+				return -1;
+		} else if (flux_oci_token_eq(json, &tokens[key], "seccomp") ||
+			   flux_oci_token_eq(json, &tokens[key], "uidMappings") ||
+			   flux_oci_token_eq(json, &tokens[key], "gidMappings") ||
+			   flux_oci_token_eq(json, &tokens[key], "devices") ||
+			   flux_oci_token_eq(json, &tokens[key], "timeOffsets") ||
+			   flux_oci_token_eq(json, &tokens[key], "intelRdt") ||
+			   flux_oci_token_eq(json, &tokens[key], "personality")) {
+			char *field = NULL;
+			char scoped[128];
+			int ret;
+
+			if (flux_oci_token_str(json, &tokens[key], &field) < 0)
+				return -1;
+			if (snprintf(scoped, sizeof(scoped), "linux.%s", field) >=
+			    (int)sizeof(scoped)) {
+				free(field);
+				return -1;
+			}
+			ret = flux_oci_reject_nonempty(json, &tokens[value], scoped);
+			free(field);
+			if (ret < 0)
 				return -1;
 		}
 
@@ -1127,6 +2542,11 @@ static int flux_oci_validate_process(void)
 
 	if (!flux_oci_cfg.cwd || flux_oci_cfg.cwd[0] != '/')
 		return -1;
+	if (flux_oci_cfg.has_console_size && !flux_oci_cfg.terminal) {
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "process.consoleSize requires process.terminal=true\n");
+		return -1;
+	}
 
 	return 0;
 }
@@ -1193,7 +2613,10 @@ static int flux_oci_parse_config(const char *json)
 		int key = tok;
 		int value = key + 1;
 
-		if (flux_oci_token_eq(json, &tokens[key], "root")) {
+		if (flux_oci_token_eq(json, &tokens[key], "ociVersion")) {
+			if (flux_oci_parse_version(json, &tokens[value]) < 0)
+				return -1;
+		} else if (flux_oci_token_eq(json, &tokens[key], "root")) {
 			if (flux_oci_parse_root(json, tokens, value) < 0)
 				return -1;
 		} else if (flux_oci_token_eq(json, &tokens[key], "process")) {
@@ -1210,9 +2633,17 @@ static int flux_oci_parse_config(const char *json)
 		} else if (flux_oci_token_eq(json, &tokens[key], "linux")) {
 			if (flux_oci_parse_linux(json, tokens, value) < 0)
 				return -1;
+		} else if (flux_oci_token_eq(json, &tokens[key], "hooks")) {
+			if (flux_oci_reject_nonempty(json, &tokens[value], "hooks") < 0)
+				return -1;
 		}
 
 		tok = flux_oci_token_skip(tokens, value);
+	}
+
+	if (!flux_oci_cfg.oci_version) {
+		FLUX_LOG(FLUX_LOG_ERR, "missing required OCI field: ociVersion\n");
+		return -1;
 	}
 
 	if (flux_oci_validate_and_normalize() < 0) {

@@ -8,6 +8,7 @@
 #include <linux/smp.h>
 #include <linux/sched/task.h>
 #include <linux/topology.h>
+#include <asm/host_ops.h>
 #include <asm/sections.h>
 
 #define BOOT_PERCPU_OFFSET ((unsigned long)__per_cpu_load)
@@ -15,6 +16,12 @@
 DEFINE_PER_CPU_READ_MOSTLY(unsigned long, this_cpu_off) = BOOT_PERCPU_OFFSET;
 EXPORT_PER_CPU_SYMBOL(this_cpu_off);
 
+/*
+ * Under CONFIG_NUMA the NUMA-aware allocator in arch/flux/mm/numa.c owns
+ * __per_cpu_offset and setup_per_cpu_areas (it does the flux percpu
+ * finalization too), so compile these out here to avoid duplicate symbols.
+ */
+#ifndef CONFIG_NUMA
 unsigned long __per_cpu_offset[NR_CPUS] __ro_after_init = {
 	[0 ... NR_CPUS - 1] = BOOT_PERCPU_OFFSET,
 };
@@ -49,3 +56,4 @@ void __init setup_per_cpu_areas(void)
 		}
 	}
 }
+#endif /* !CONFIG_NUMA */

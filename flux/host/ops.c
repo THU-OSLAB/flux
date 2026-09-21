@@ -24,6 +24,7 @@
 
 #include <flux.h>
 #include <flux/mpk.h>
+#include <flux/rewrite.h>
 
 #include "io/iok_client.h"
 #include "kmod.h"
@@ -38,11 +39,44 @@
 #error "POSIX semaphores not supported, please enable _POSIX_SEMAPHORES in your build system"
 #endif /* _POSIX_SEMAPHORES */
 
+static void write_stdout(const char *str, size_t len)
+{
+	size_t off = 0;
+
+	while (off < len) {
+		ssize_t ret = write(STDOUT_FILENO, str + off, len - off);
+
+		if (ret < 0 && errno == EINTR)
+			continue;
+		if (ret <= 0)
+			break;
+		off += (size_t)ret;
+	}
+}
+
 static void print(const char *str, int len)
 {
-	int ret __attribute__((unused));
+	size_t start = 0;
+	size_t i;
 
-	ret = write(STDOUT_FILENO, str, len);
+	if (!str || len <= 0)
+		return;
+
+	if (!flux_stdout_needs_crlf()) {
+		write_stdout(str, (size_t)len);
+		return;
+	}
+
+	for (i = 0; i < (size_t)len; i++) {
+		if (str[i] != '\n' || (i && str[i - 1] == '\r'))
+			continue;
+
+		write_stdout(str + start, i - start);
+		write_stdout("\r\n", 2);
+		start = i + 1;
+	}
+
+	write_stdout(str + start, (size_t)len - start);
 }
 
 #define WARN_UNLESS(exp)                                           \
@@ -140,59 +174,6 @@ static void sem_down(struct flux_sem *sem)
 #endif /* _POSIX_SEMAPHORES */
 }
 
-#ifndef CONFIG_FLUX_UINTR
-struct flux_mutex {
-	pthread_mutex_t mutex;
-};
-
-static struct flux_mutex *mutex_alloc(int recursive)
-{
-	struct flux_mutex *_mutex = malloc(sizeof(struct flux_mutex));
-	pthread_mutex_t *mutex = NULL;
-	pthread_mutexattr_t attr;
-
-	if (!_mutex)
-		return NULL;
-
-	mutex = &_mutex->mutex;
-	WARN_PTHREAD(pthread_mutexattr_init(&attr));
-
-	/* PTHREAD_MUTEX_ERRORCHECK is *very* useful for debugging,
-	 * but has some overhead, so we provide an option to turn it
-	 * off. */
-#ifdef DEBUG
-	if (!recursive)
-		WARN_PTHREAD(pthread_mutexattr_settype(
-			&attr, PTHREAD_MUTEX_ERRORCHECK));
-#endif /* DEBUG */
-
-	if (recursive)
-		WARN_PTHREAD(pthread_mutexattr_settype(
-			&attr, PTHREAD_MUTEX_RECURSIVE));
-
-	WARN_PTHREAD(pthread_mutex_init(mutex, &attr));
-
-	return _mutex;
-}
-
-static void mutex_lock(struct flux_mutex *mutex)
-{
-	WARN_PTHREAD(pthread_mutex_lock(&mutex->mutex));
-}
-
-static void mutex_unlock(struct flux_mutex *_mutex)
-{
-	pthread_mutex_t *mutex = &_mutex->mutex;
-	WARN_PTHREAD(pthread_mutex_unlock(mutex));
-}
-
-static void mutex_free(struct flux_mutex *_mutex)
-{
-	pthread_mutex_t *mutex = &_mutex->mutex;
-	WARN_PTHREAD(pthread_mutex_destroy(mutex));
-	free(_mutex);
-}
-#endif /* !CONFIG_FLUX_UINTR */
 
 struct flux_thread_wrapper_arg {
 	void (*fn)(void *arg);
@@ -311,67 +292,31 @@ static unsigned long long time_ns(void)
 	return 1e9 * ts.tv_sec + ts.tv_nsec;
 }
 
-#ifndef CONFIG_FLUX_UINTR
-static void flux_timer_callback(union sigval sv)
-{
-	struct flux_timer_args *args = sv.sival_ptr;
-
-	flux_mpk_enter_kernel();
-
-	args->fn(args->cpu);
-}
-#endif
 
 static void *timer_alloc(struct flux_timer_args *timer_args)
 {
-#ifdef CONFIG_FLUX_UINTR
 	return flux_iok_client_timer_alloc(timer_args->cpu, timer_args->oneshot);
-#else
-	int err;
-	timer_t timer;
-
-	struct sigevent se =  {
-		.sigev_notify = SIGEV_THREAD,
-		.sigev_value = {
-			.sival_ptr = timer_args,
-		},
-		.sigev_notify_function = flux_timer_callback,
-	};
-
-	err = timer_create(CLOCK_REALTIME, &se, &timer);
-	if (err)
-		return NULL;
-
-	return (void *)(long)timer;
-#endif
 }
 
 static int timer_set_oneshot(void *_timer, unsigned long ns)
 {
-#ifdef CONFIG_FLUX_UINTR
 	return flux_iok_client_timer_set_oneshot(_timer, ns);
-#else
-	timer_t timer = (timer_t)(long)_timer;
-	struct itimerspec ts = {
-		.it_value = {
-			.tv_sec = ns / 1000000000,
-			.tv_nsec = ns % 1000000000,
-		},
-	};
-
-	return timer_settime(timer, 0, &ts, NULL);
-#endif
 }
 
 static void timer_free(void *_timer)
 {
-#ifdef CONFIG_FLUX_UINTR
 	/* do nothing */
-#else
-	timer_t timer = (timer_t)(long)_timer;
+}
 
-	timer_delete(timer);
-#endif
+static void host_yield(void)
+{
+	/*
+	 * The CPU is pinned to a dedicated host CPU. Stay in userspace while
+	 * idle so a timer UINTR can be delivered directly; repeatedly entering
+	 * sched_yield() forces notifications through the host-kernel posted-IPI
+	 * reinjection path and can lose progress in short hrtimer workloads.
+	 */
+	__asm__ __volatile__("pause" ::: "memory");
 }
 
 static void panic(void)
@@ -379,9 +324,15 @@ static void panic(void)
 	exit(-1);
 }
 
-static long _gettid(void)
+static __attribute__((no_stack_protector)) long _gettid(void)
 {
-	return syscall(__flux__NR_gettid);
+	long ret;
+
+	asm volatile("syscall"
+		     : "=a"(ret)
+		     : "a"(__flux__NR_gettid)
+		     : "rcx", "r11", "memory");
+	return ret;
 }
 
 static void *posix_malloc(unsigned long size)
@@ -502,10 +453,51 @@ static void page_free_normal(void *addr, unsigned long size)
 	munmap(addr, size);
 }
 
+/* Static hugetlb backing requires full population and never falls back. */
+static void *page_alloc_static_huge(void *hint, unsigned long size)
+{
+	unsigned char *resident;
+	size_t i, pages = size / PGSIZE_4KB;
+	void *addr;
+
+	if ((unsigned long)hint % PGSIZE_2MB || !size || size % PGSIZE_2MB)
+		return NULL;
+	addr = flux_mem_map_anom(hint, size, PGSIZE_2MB, 0);
+	if (addr == MAP_FAILED)
+		return NULL;
+	/*
+	 * MAP_POPULATE may fail silently. Check residency before use so an
+	 * undersized hugepage pool produces a controlled boot failure.
+	 */
+	resident = malloc(pages);
+	if (!resident || mincore(addr, size, resident)) {
+		free(resident);
+		goto out_munmap;
+	}
+	for (i = 0; i < pages && (resident[i] & 1); i++)
+		;
+	free(resident);
+	if (i != pages)
+		goto out_munmap;
+	FLUX_LOG(FLUX_LOG_INFO, "static hugetlb memory: %lu MiB at %p\n",
+		 size >> 20, addr);
+	return addr;
+
+out_munmap:
+	munmap(addr, size);
+	return NULL;
+}
+
 static void *page_alloc(void *hint, unsigned long size, unsigned long align,
 			int flags)
 {
 	int node = FLUX_PAGE_ALLOC_NODE(flags);
+
+	if (flags & FLUX_PAGE_ALLOC_STATIC_HUGE) {
+		if (node || (flags & FLUX_PAGE_ALLOC_DMA))
+			return NULL;
+		return page_alloc_static_huge(hint, size);
+	}
 
 #ifdef CONFIG_FLUX_FNET
 	if (flux_env.fnet_enabled && FLUX_PAGE_ALLOC_IS_DMA(flags)) {
@@ -524,6 +516,32 @@ static void page_free(void *addr, unsigned long size)
 	}
 #endif
 	page_free_normal(addr, size);
+}
+
+static int rewrite_exec(void *addr, unsigned long len)
+{
+	size_t bad_offset = 0;
+	int ret = flux_rewrite_exec(addr, len, &bad_offset);
+
+	if (ret < 0) {
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "failed to rewrite executable range [%p, %p) at +0x%zx\n",
+			 addr, (char *)addr + len, bad_offset);
+		return ret;
+	}
+	ret = flux_mpk_scan_exec(addr, len, &bad_offset);
+	if (ret < 0) {
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "rewrite produced unsafe MPK bytes in range [%p, %p) at +0x%zx\n",
+			 addr, (char *)addr + len, bad_offset);
+		flux_rewrite_invalidate(addr, len, true);
+	}
+	return ret;
+}
+
+static int invalidate_exec(void *addr, unsigned long len, bool restore)
+{
+	return flux_rewrite_invalidate(addr, len, restore);
 }
 
 struct flux_host_operations flux_host_ops = {
@@ -549,17 +567,12 @@ struct flux_host_operations flux_host_ops = {
 	.page_free = page_free,
 	.gettid = _gettid,
 	.getcpu = sched_getcpu,
-#ifdef CONFIG_FLUX_UINTR
+	.yield = host_yield,
 	.uintr_register_ipi = flux_uintr_register_ipi,
-#endif
-#ifndef CONFIG_FLUX_UINTR
-	.mutex_alloc = mutex_alloc,
-	.mutex_free = mutex_free,
-	.mutex_lock = mutex_lock,
-	.mutex_unlock = mutex_unlock,
-#endif
 	.timer_alloc = timer_alloc,
 	.timer_set_oneshot = timer_set_oneshot,
 	.timer_free = timer_free,
-	.load_elf = flux_load_elf,
+	.handle_mpk_fault = flux_mpk_handle_fault,
+	.rewrite_exec = rewrite_exec,
+	.invalidate_exec = invalidate_exec,
 };

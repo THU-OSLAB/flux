@@ -48,6 +48,33 @@ static void flux_runc_background_monitor_or_exit(struct flux_runc_state *state,
 						 int console_slave_fd)
 	__attribute__((noreturn));
 
+static int flux_runc_apply_saved_console_size(
+	const struct flux_runc_state *state, int fd)
+{
+	const struct flux_oci_cfg *oci;
+	int ret;
+
+	ret = flux_runc_set_bundle_config(state->bundle_dir,
+					  state->oci_config_path);
+	if (ret < 0)
+		return ret;
+	ret = flux_runc_load_bundle();
+	if (ret < 0)
+		goto out;
+
+	oci = flux_oci_cfg_get();
+	if (!oci) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (oci->has_console_size)
+		ret = flux_runc_console_set_size(fd, oci->console_width,
+						 oci->console_height);
+out:
+	flux_runc_unload();
+	return ret;
+}
+
 static int flux_runc_runner_prepare_start(const struct flux_runc_state *state)
 {
 	if (!state || !state->exec_ring_name)
@@ -336,10 +363,11 @@ static int flux_runc_set_signal_bridge_env(void)
 		return 0;
 	}
 
-	if (strstr(bridged_signals, "SIGUSR1"))
+	if (strstr(bridged_signals, FLUX_SIGNAL_CTRL_DOORBELL_STR))
 		return 0;
 
-	len = snprintf(NULL, 0, "%s,%s", bridged_signals, "SIGUSR1");
+	len = snprintf(NULL, 0, "%s,%s", bridged_signals,
+		       FLUX_SIGNAL_CTRL_DOORBELL_STR);
 	if (len < 0)
 		return -EINVAL;
 
@@ -347,7 +375,8 @@ static int flux_runc_set_signal_bridge_env(void)
 	if (!merged)
 		return -ENOMEM;
 
-	snprintf(merged, (size_t)len + 1, "%s,%s", bridged_signals, "SIGUSR1");
+	snprintf(merged, (size_t)len + 1, "%s,%s", bridged_signals,
+		 FLUX_SIGNAL_CTRL_DOORBELL_STR);
 	if (setenv(FLUX_SIGNAL_BRIDGE_ENV, merged, 1) < 0) {
 		free(merged);
 		return -errno;
@@ -436,6 +465,12 @@ static int flux_runc_exec_child_main(const struct flux_runc_state *state,
 
 	if (notify_fd >= 0)
 		close(notify_fd);
+
+	ret = flux_runc_cgroup_join(state, getpid());
+	if (ret < 0) {
+		flux_runc_log_errno("failed to join container cgroup", ret);
+		return ret;
+	}
 
 	if (console_slave_fd >= 0)
 		flux_runc_console_setup_detached_terminal(console_master_fd,
@@ -639,6 +674,27 @@ int flux_runc_runner_exec(const char *container_id, char **argv)
 	}
 
 	ret = flux_launch_run(&spec);
+	if (ret == 0 && state.exec_ring_name) {
+		struct flux_exec_ring *ring = NULL;
+		int ring_fd = -1;
+		int ring_ret;
+
+		ring_ret = flux_runc_exec_ring_open(state.exec_ring_name, false,
+						       false, &ring, &ring_fd);
+		if (ring_ret == 0) {
+			int wait_status = flux_exec_ring_init_status_load(ring);
+
+			if (wait_status >= 0) {
+				if (WIFEXITED(wait_status))
+					ret = WEXITSTATUS(wait_status);
+				else if (WIFSIGNALED(wait_status))
+					ret = 128 + WTERMSIG(wait_status);
+				else
+					ret = EXIT_FAILURE;
+			}
+			flux_runc_exec_ring_close(ring, ring_fd);
+		}
+	}
 	flux_launch_cleanup(&spec);
 	flux_runc_state_fini(&state);
 	return ret;
@@ -688,6 +744,9 @@ int flux_runc_runner_start_terminal_detached(struct flux_runc_state *state,
 	ret = flux_runc_console_open_detached_pty(&master_fd, &slave_fd);
 	if (ret < 0)
 		return ret;
+	ret = flux_runc_apply_saved_console_size(state, slave_fd);
+	if (ret < 0)
+		goto out;
 
 	ret = flux_runc_spawn_background_monitor(state, pid_file, false,
 						  FLUX_RUNC_RUNNING,
@@ -725,6 +784,9 @@ int flux_runc_runner_create_terminal_detached(struct flux_runc_state *state,
 	ret = flux_runc_console_open_detached_pty(&master_fd, &slave_fd);
 	if (ret < 0)
 		return ret;
+	ret = flux_runc_apply_saved_console_size(state, slave_fd);
+	if (ret < 0)
+		goto out;
 
 	ret = flux_runc_spawn_background_monitor(state, pid_file, true,
 						  FLUX_RUNC_CREATED,
@@ -842,9 +904,26 @@ int flux_runc_runner_signal(const struct flux_runc_state *state, int sig)
 
 	value.sival_int = flux_signal_ctrl_pack(FLUX_SIGNAL_CTRL_KILL,
 						(unsigned int)sig, 0);
-	if (sigqueue(target_pid, SIGUSR1, value) < 0)
+	if (sigqueue(target_pid, FLUX_SIGNAL_CTRL_DOORBELL, value) < 0)
 		return -errno;
 
+	return 0;
+}
+
+int flux_runc_runner_resource_signal(const struct flux_runc_state *state)
+{
+	pid_t target_pid;
+	union sigval value;
+	int ret;
+
+	if (!state || state->init_pid <= 0)
+		return -ESRCH;
+	ret = flux_runc_state_control_pid(state, &target_pid);
+	if (ret < 0)
+		return ret;
+	value.sival_int = flux_signal_ctrl_pack(FLUX_SIGNAL_CTRL_RESOURCE, 0, 0);
+	if (sigqueue(target_pid, FLUX_SIGNAL_CTRL_DOORBELL, value) < 0)
+		return -errno;
 	return 0;
 }
 

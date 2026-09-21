@@ -3,7 +3,6 @@
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include <flux.h>
 #include <kernel/asm/fnet.h>
@@ -50,7 +49,8 @@ static int flux_fnet_config_dev(int ifindex, const struct flux_fnet_netdev *dev)
 
 	ret = flux_if_up(ifindex);
 	if (ret < 0) {
-		FLUX_LOG(FLUX_LOG_ERR, "failed to bring up fnet netdev: %d\n", ret);
+		FLUX_LOG(FLUX_LOG_ERR, "failed to bring up fnet netdev: %d\n",
+			 ret);
 		goto out;
 	}
 
@@ -72,14 +72,16 @@ static int flux_fnet_config_dev(int ifindex, const struct flux_fnet_netdev *dev)
 			goto out;
 		}
 
-		nmlen = run_cfg->nic_ip_mask ? netmask_to_prefix(run_cfg->nic_ip_mask) :
-					      24;
+		nmlen = run_cfg->nic_ip_mask ?
+				netmask_to_prefix(run_cfg->nic_ip_mask) :
+				24;
 		if (addr != FLUX_INADDR_NONE && nmlen > 0 && nmlen < 32) {
 			ret = flux_if_set_ipv4(ifindex, addr, nmlen);
 			if (ret < 0) {
-				FLUX_LOG(FLUX_LOG_ERR,
-					 "failed to set ip addr on fnet netdev: %d\n",
-					 ret);
+				FLUX_LOG(
+					FLUX_LOG_ERR,
+					"failed to set ip addr on fnet netdev: %d\n",
+					ret);
 				goto out;
 			}
 		}
@@ -94,7 +96,8 @@ static int flux_fnet_config_dev(int ifindex, const struct flux_fnet_netdev *dev)
 		if (run_cfg->nic_ip_gw) {
 			if (inet_pton(FLUX_AF_INET, run_cfg->nic_ip_gw,
 				      (struct flux_in_addr *)&gwaddr) != 1) {
-				FLUX_LOG(FLUX_LOG_ERR, "invalid nic_ip_gw: %s\n",
+				FLUX_LOG(FLUX_LOG_ERR,
+					 "invalid nic_ip_gw: %s\n",
 					 run_cfg->nic_ip_gw);
 				ret = -FLUX_EINVAL;
 				goto out;
@@ -104,9 +107,10 @@ static int flux_fnet_config_dev(int ifindex, const struct flux_fnet_netdev *dev)
 				ret = flux_if_set_ipv4_gateway(ifindex, addr,
 							       nmlen, gwaddr);
 				if (ret < 0) {
-					FLUX_LOG(FLUX_LOG_ERR,
-						 "failed to set gateway on fnet netdev: %d\n",
-						 ret);
+					FLUX_LOG(
+						FLUX_LOG_ERR,
+						"failed to set gateway on fnet netdev: %d\n",
+						ret);
 					goto out;
 				}
 			}
@@ -191,6 +195,7 @@ int flux_fnet_register_dev(void)
 		.port_id = FLUX_FNET_PORT,
 	};
 	int fd;
+	int ifindex;
 	int ret;
 
 	if (!flux_fnet_is_configured())
@@ -212,20 +217,43 @@ int flux_fnet_register_dev(void)
 		fd = flux_sys_open(FLUX_FNET_CTRL_DEV_PATH, FLUX_O_RDWR, 0);
 		if (fd < 0) {
 			ret = -FLUX_ENODEV;
-			FLUX_LOG(FLUX_LOG_ERR, "failed to open %s after mknod\n",
+			FLUX_LOG(FLUX_LOG_ERR,
+				 "failed to open %s after mknod\n",
 				 FLUX_FNET_CTRL_DEV_PATH);
 			goto out_free;
 		}
 	}
 
 	ret = flux_sys_ioctl(fd, FLUX_FNET_IOCTL_ADD, (unsigned long)&dev);
-	flux_sys_close(fd);
 	if (ret < 0) {
-		FLUX_LOG(FLUX_LOG_ERR, "ioctl FLUX_FNET_IOCTL_ADD failed: %d\n", ret);
-		goto out_free;
+		FLUX_LOG(FLUX_LOG_ERR, "ioctl FLUX_FNET_IOCTL_ADD failed: %d\n",
+			 ret);
+		goto out_close;
 	}
+	ifindex = ret;
 
-	ret = flux_fnet_config_dev(ret, &dev);
+	ret = flux_iok_client_activate_netdev();
+	if (ret < 0)
+		FLUX_LOG(FLUX_LOG_ERR, "failed to activate fnet backend: %d\n",
+			 ret);
+	if (ret < 0)
+		goto out_del;
+
+	ret = flux_fnet_config_dev(ifindex, &dev);
+	if (ret < 0)
+		goto out_del;
+
+	flux_sys_close(fd);
+	flux_fnet_free_dev(&dev);
+	return 0;
+
+out_del:
+	if (flux_sys_ioctl(fd, FLUX_FNET_IOCTL_DEL, (unsigned long)ifindex) < 0)
+		FLUX_LOG(FLUX_LOG_ERR,
+			 "failed to roll back fnet netdev ifindex=%d\n",
+			 ifindex);
+out_close:
+	flux_sys_close(fd);
 
 out_free:
 	flux_fnet_free_dev(&dev);

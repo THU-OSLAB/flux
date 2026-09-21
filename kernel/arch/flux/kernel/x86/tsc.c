@@ -27,27 +27,16 @@ static unsigned int __initdata tsc_early_khz;
 static DEFINE_STATIC_KEY_FALSE(__use_tsc);
 
 /*
- * We use the full linear equation: f(x) = a + b*x, in order to allow
- * a continuous function in the face of dynamic freq changes.
- *
- * Continuity means that when our frequency changes our slope (b); we want to
- * ensure that: f(t) == f'(t), which gives: a + b*t == a' + b'*t.
- *
- * Without an offset (a) the above would not be possible.
- *
- * See the comment near cycles_2_ns() for details on how we compute (b).
+ * Flux calibrates once before enabling the TSC clock and gives every vCPU
+ * the same conversion. There is no runtime frequency update or per-CPU
+ * offset adjustment, so readers need neither a latch nor a CPU lookup.
  */
 struct cyc2ns_data {
 	u32 cyc2ns_mul;
 	u32 cyc2ns_shift;
 	u64 cyc2ns_offset;
-}; /* 16 bytes */
-
-struct cyc2ns {
-	struct cyc2ns_data data[2]; /*  0 + 2*16 = 32 */
-	seqcount_latch_t seq; /* 32 + 4 = 36 */
-}; /* fits one cacheline */
-static DEFINE_PER_CPU_ALIGNED(struct cyc2ns, cyc2ns);
+};
+static struct cyc2ns_data flux_cyc2ns __ro_after_init;
 
 static void delay_loop(u64 __loops);
 
@@ -57,33 +46,6 @@ static void delay_loop(u64 __loops);
  */
 static void (*delay_fn)(u64) __ro_after_init = delay_loop;
 static void (*delay_halt_fn)(u64 start, u64 cycles) __ro_after_init;
-
-__always_inline void __cyc2ns_read(struct cyc2ns_data *data)
-{
-	int seq, idx;
-
-	do {
-		seq = this_cpu_read(cyc2ns.seq.seqcount.sequence);
-		idx = seq & 1;
-
-		data->cyc2ns_offset =
-			this_cpu_read(cyc2ns.data[idx].cyc2ns_offset);
-		data->cyc2ns_mul = this_cpu_read(cyc2ns.data[idx].cyc2ns_mul);
-		data->cyc2ns_shift =
-			this_cpu_read(cyc2ns.data[idx].cyc2ns_shift);
-	} while (unlikely(seq != this_cpu_read(cyc2ns.seq.seqcount.sequence)));
-}
-
-__always_inline void cyc2ns_read_begin(struct cyc2ns_data *data)
-{
-	preempt_disable_notrace();
-	__cyc2ns_read(data);
-}
-
-__always_inline void cyc2ns_read_end(void)
-{
-	preempt_enable_notrace();
-}
 
 /*
  * Accelerators for sched_clock()
@@ -111,10 +73,8 @@ __always_inline void cyc2ns_read_end(void)
 
 static __always_inline unsigned long long __cycles_2_ns(unsigned long long cyc)
 {
-	struct cyc2ns_data data;
+	struct cyc2ns_data data = flux_cyc2ns;
 	unsigned long long ns;
-
-	__cyc2ns_read(&data);
 
 	ns = data.cyc2ns_offset;
 	ns += mul_u64_u32_shr(cyc, data.cyc2ns_mul, data.cyc2ns_shift);
@@ -131,20 +91,15 @@ static __always_inline unsigned long long cycles_2_ns(unsigned long long cyc)
 	return ns;
 }
 
-static void __set_cyc2ns_scale(unsigned long khz, int cpu,
+static void __init flux_init_cyc2ns(unsigned long khz,
 			       unsigned long long tsc_now)
 {
 	unsigned long long ns_now;
 	struct cyc2ns_data data;
-	struct cyc2ns *c2n;
 
 	ns_now = cycles_2_ns(tsc_now);
 
-	/*
-	 * Compute a new multiplier as per the above comment and ensure our
-	 * time function is continuous; see the comment near struct
-	 * cyc2ns_data.
-	 */
+	/* Preserve continuity with the pre-calibration (zero) clock. */
 	clocks_calc_mult_shift(&data.cyc2ns_mul, &data.cyc2ns_shift, khz,
 			       NSEC_PER_MSEC, 0);
 
@@ -162,12 +117,7 @@ static void __set_cyc2ns_scale(unsigned long khz, int cpu,
 	data.cyc2ns_offset = ns_now - mul_u64_u32_shr(tsc_now, data.cyc2ns_mul,
 						      data.cyc2ns_shift);
 
-	c2n = per_cpu_ptr(&cyc2ns, cpu);
-
-	raw_write_seqcount_latch(&c2n->seq);
-	c2n->data[0] = data;
-	raw_write_seqcount_latch(&c2n->seq);
-	c2n->data[1] = data;
+	flux_cyc2ns = data;
 }
 
 /*
@@ -203,47 +153,20 @@ u64 native_sched_clock_from_tsc(u64 tsc)
 	return cycles_2_ns(tsc);
 }
 
+#if defined(CONFIG_ARCH_WANTS_NO_INSTR) || defined(CONFIG_GENERIC_SCHED_CLOCK)
 u64 sched_clock_noinstr(void) __attribute__((alias("native_sched_clock")));
+#define flux_sched_clock_noinstr sched_clock_noinstr
+#else
+#define flux_sched_clock_noinstr native_sched_clock
+#endif
 
 notrace u64 sched_clock(void)
 {
 	u64 now;
 	preempt_disable_notrace();
-	now = sched_clock_noinstr();
+	now = flux_sched_clock_noinstr();
 	preempt_enable_notrace();
 	return now;
-}
-
-/*
- * Initialize cyc2ns for boot cpu
- */
-static void __init cyc2ns_init_boot_cpu(void)
-{
-	struct cyc2ns *c2n = this_cpu_ptr(&cyc2ns);
-
-	seqcount_latch_init(&c2n->seq);
-	__set_cyc2ns_scale(tsc_khz, smp_processor_id(), rdtsc());
-}
-
-/*
- * Secondary CPUs do not run through tsc_init(), so set up
- * all the scale factors for all CPUs, assuming the same
- * speed as the bootup CPU.
- */
-static void __init cyc2ns_init_secondary_cpus(void)
-{
-	unsigned int cpu, this_cpu = smp_processor_id();
-	struct cyc2ns *c2n = this_cpu_ptr(&cyc2ns);
-	struct cyc2ns_data *data = c2n->data;
-
-	for_each_possible_cpu(cpu) {
-		if (cpu != this_cpu) {
-			seqcount_latch_init(&c2n->seq);
-			c2n = per_cpu_ptr(&cyc2ns, cpu);
-			c2n->data[0] = data[0];
-			c2n->data[1] = data[1];
-		}
-	}
 }
 
 static unsigned long __init get_loops_per_jiffy(void)
@@ -257,7 +180,7 @@ static unsigned long __init get_loops_per_jiffy(void)
 static void __init tsc_enable_sched_clock(void)
 {
 	loops_per_jiffy = get_loops_per_jiffy();
-	cyc2ns_init_boot_cpu();
+	flux_init_cyc2ns(tsc_khz, rdtsc());
 	static_branch_enable(&__use_tsc);
 }
 
@@ -367,7 +290,6 @@ void __init tsc_init(void)
 	if (!determine_cpu_tsc_frequencies(true))
 		return;
 	tsc_enable_sched_clock();
-	cyc2ns_init_secondary_cpus();
 	lpj_fine = get_loops_per_jiffy();
 }
 
@@ -527,11 +449,7 @@ void __init time_init(void)
 
 	clocksource_register_khz(&clocksource_tsc, tsc_khz);
 
-#ifdef CONFIG_FLUX_UINTR
 	uintr_timer_init();
-#else
-	default_timer_init();
-#endif
 
 	return;
 }

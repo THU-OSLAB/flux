@@ -1,6 +1,7 @@
 {
   "cpu_range": "1-4",
-  "nic_pci_addr": "0000:17:00.0",
+  "nic_pci_addr": "0000:99:00.0",
+  "mlx5_external": true,
   "mtu": 1500,
   "tx_chksum_offload": true
 }

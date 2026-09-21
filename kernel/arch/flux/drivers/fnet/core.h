@@ -21,6 +21,7 @@ extern struct mbuf *net_rx_alloc_mbuf(unsigned long data,
 				      union flux_rxq_cmd cmd);
 extern void net_rx_trans(struct mbuf *m);
 extern void net_rx_batch(struct mbuf **ms, unsigned int nr);
+extern bool net_rx_fast_tcp(struct mbuf *m);
 extern void tcp_rx_closed(struct mbuf *m);
 extern void tcp_free_rx_bufs(void);
 

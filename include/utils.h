@@ -15,6 +15,7 @@
 #include <utils/log.h>
 #include <utils/lrpc.h>
 #include <utils/memory.h>
+#include <utils/parse.h>
 #include <utils/path.h>
 #include <utils/time.h>
 

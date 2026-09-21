@@ -3,6 +3,8 @@
 
 #ifndef __ASSEMBLY__
 
+#include <asm/x86/cpufeatures.h>
+
 /*
  *  CPU type and hardware bug flags. Kept separately for each CPU.
  *  Members of this structure are referenced in head_32.S, so think twice
@@ -83,15 +85,31 @@ static inline unsigned long __get_wchan(struct task_struct *p)
 	return 0;
 }
 
-static inline void flush_thread(void)
-{
-}
+void flush_thread(void);
 
 struct thread_struct {
 	unsigned long sp;
 	unsigned long fsbase;
 	struct pt_regs *regs;
+	unsigned long fault_address;
+	unsigned long fault_error;
+	int fault_signal;
+	int fault_code;
+	unsigned int iopl_emul;
+#ifdef CONFIG_FLUX_MPK
+	unsigned int mpk_uaccess_depth;
+	struct flux_xol_state *xol;
+	struct io_bitmap *io_bitmap;
+#endif
 };
+
+#define GET_TSC_CTL(adr) get_tsc_mode((adr))
+#define SET_TSC_CTL(val) set_tsc_mode((val))
+
+int get_tsc_mode(unsigned long adr);
+int set_tsc_mode(unsigned int val);
+bool flux_tsc_enter_kernel_mode(void);
+void flux_tsc_restore_user_mode(bool restore);
 
 extern unsigned long __end_init_task[];
 
@@ -101,6 +119,7 @@ extern unsigned long __end_init_task[];
 		      sizeof(struct pt_regs),                              \
 		.fsbase = 0,                                               \
 		.regs = (void *)&__end_init_task - sizeof(struct pt_regs), \
+		.iopl_emul = 0,                                            \
 	}
 
 extern void fill_cpuinfo(struct cpuinfo_x86 *c);

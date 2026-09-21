@@ -35,7 +35,7 @@ struct pt_regs {
 		u64 flags;
 		struct {
 			u32 eflags;
-			u32 uif : 1;
+			u32 : 1; /* RFLAGS bit 32 is not hardware UIF. */
 			u32 umode : 1;
 		};
 	};
@@ -94,7 +94,13 @@ static inline void user_stack_pointer_set(struct pt_regs *regs,
 
 static __always_inline bool regs_irqs_disabled(struct pt_regs *regs)
 {
-	return regs->uif == 0;
+	/*
+	 * This describes the interrupted state, not the live UIF.  Real UINTR
+	 * and synthetic signal injection enter only for captured prior UIF=1;
+	 * captured UIF=0 leaves the work pending instead.
+	 */
+	(void)regs;
+	return false;
 }
 
 #define user_mode(regs) (regs->umode)

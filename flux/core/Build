@@ -1,2 +1,3 @@
-libflux-y += init.o config.o elf.o oci.o vdso.o
+libflux-y += init.o config.o env.o oci.o
+libflux-y += rewrite.o
 libflux-$(CONFIG_FLUX_MPK) += mpk.o

@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <termios.h>
+#include <unistd.h>
 
 #include <utils/log.h>
 
@@ -17,6 +19,28 @@
 #define COLOR_MAGENTA "\033[35m"
 #define COLOR_GREY "\033[90m"
 #define COLOR_RESET "\033[0m"
+
+bool flux_stdout_needs_crlf(void)
+{
+	static int needs_crlf = -1;
+	struct termios attr;
+	int cached;
+
+	cached = __atomic_load_n(&needs_crlf, __ATOMIC_RELAXED);
+	if (cached < 0) {
+		cached = tcgetattr(STDOUT_FILENO, &attr) == 0 &&
+			 ((attr.c_oflag & (OPOST | ONLCR)) !=
+			  (OPOST | ONLCR));
+		__atomic_store_n(&needs_crlf, cached, __ATOMIC_RELAXED);
+	}
+
+	return cached;
+}
+
+static const char *logk_newline(void)
+{
+	return flux_stdout_needs_crlf() ? "\r\n" : "\n";
+}
 
 void logk(int level, const char *fmt, ...)
 {
@@ -60,9 +84,9 @@ void logk(int level, const char *fmt, ...)
 	}
 	if (color) {
 		printf("%s%s%s%s", color, buf, COLOR_RESET,
-		       has_newline ? "\n" : "");
+		       has_newline ? logk_newline() : "");
 	} else {
-		printf("%s%s", buf, has_newline ? "\n" : "");
+		printf("%s%s", buf, has_newline ? logk_newline() : "");
 	}
 
 	fflush(stdout);

@@ -6,7 +6,6 @@
 
 #ifndef __ASSEMBLY__
 
-#ifdef CONFIG_FLUX_UINTR
 
 static __always_inline unsigned long native_save_flags(void)
 {
@@ -74,15 +73,10 @@ static __always_inline void arch_local_irq_restore(unsigned long flags)
 {
 	if (!arch_irqs_disabled_flags(flags))
 		arch_local_irq_enable();
+	else
+		arch_local_irq_disable();
 }
 
-#else
-
-/* generic implementations */
-
-#include <asm-generic/irqflags.h>
-
-#endif
 
 #endif /* !__ASSEMBLY__ */
 

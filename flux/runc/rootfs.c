@@ -16,7 +16,8 @@
 struct flux_oci_dev_node {
 	const char *path;
 	flux_mode_t mode;
-	unsigned int dev;
+	unsigned int major;
+	unsigned int minor;
 };
 
 struct flux_oci_symlink {
@@ -633,13 +634,13 @@ static int flux_oci_symlink_ignore_exists(const char *target,
 static int flux_oci_populate_devtmpfs(void)
 {
 	static const struct flux_oci_dev_node nodes[] = {
-		{ "/dev/null", FLUX_S_IFCHR | 0666, FLUX_MKDEV(1, 3) },
-		{ "/dev/zero", FLUX_S_IFCHR | 0666, FLUX_MKDEV(1, 5) },
-		{ "/dev/full", FLUX_S_IFCHR | 0666, FLUX_MKDEV(1, 7) },
-		{ "/dev/random", FLUX_S_IFCHR | 0666, FLUX_MKDEV(1, 8) },
-		{ "/dev/urandom", FLUX_S_IFCHR | 0666, FLUX_MKDEV(1, 9) },
-		{ "/dev/tty", FLUX_S_IFCHR | 0666, FLUX_MKDEV(5, 0) },
-		{ "/dev/console", FLUX_S_IFCHR | 0600, FLUX_MKDEV(5, 1) },
+		{ "/dev/null", FLUX_S_IFCHR | 0666, 1, 3 },
+		{ "/dev/zero", FLUX_S_IFCHR | 0666, 1, 5 },
+		{ "/dev/full", FLUX_S_IFCHR | 0666, 1, 7 },
+		{ "/dev/random", FLUX_S_IFCHR | 0666, 1, 8 },
+		{ "/dev/urandom", FLUX_S_IFCHR | 0666, 1, 9 },
+		{ "/dev/tty", FLUX_S_IFCHR | 0666, 5, 0 },
+		{ "/dev/console", FLUX_S_IFCHR | 0600, 5, 1 },
 	};
 	static const struct flux_oci_symlink symlinks[] = {
 		{ "/dev/fd", "/proc/self/fd" },
@@ -656,13 +657,22 @@ static int flux_oci_populate_devtmpfs(void)
 		return err;
 
 	for (i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+		if (!flux_oci_device_allowed(
+			    flux_oci_cfg_get(), 'c', nodes[i].major, nodes[i].minor,
+			    FLUX_OCI_DEVICE_READ | FLUX_OCI_DEVICE_WRITE))
+			continue;
+		FLUX_LOG(FLUX_LOG_INFO, "creating OCI device %s (%u:%u)\n",
+			 nodes[i].path, nodes[i].major, nodes[i].minor);
 		err = flux_oci_mknod_ignore_exists(nodes[i].path, nodes[i].mode,
-						   nodes[i].dev);
+						   FLUX_MKDEV(nodes[i].major,
+							      nodes[i].minor));
 		if (err < 0)
 			return err;
 	}
 
 	for (i = 0; i < sizeof(symlinks) / sizeof(symlinks[0]); i++) {
+		FLUX_LOG(FLUX_LOG_INFO, "creating OCI symlink %s -> %s\n",
+			 symlinks[i].path, symlinks[i].target);
 		err = flux_oci_symlink_ignore_exists(symlinks[i].target,
 						     symlinks[i].path);
 		if (err < 0)
@@ -676,15 +686,22 @@ int flux_runc_enter_container_fs(void)
 {
 	int err;
 
+	FLUX_LOG(FLUX_LOG_INFO, "entering OCI container filesystem\n");
 	err = flux_sys_chdir(FLUX_OCI_CONTAINER_ROOT);
 	if (err < 0)
 		return err;
+	FLUX_LOG(FLUX_LOG_INFO, "changed directory to OCI container root\n");
 
 	err = flux_sys_chroot(".");
 	if (err < 0)
 		return err;
+	FLUX_LOG(FLUX_LOG_INFO, "changed OCI process root\n");
 
-	return flux_sys_chdir("/");
+	err = flux_sys_chdir("/");
+	if (err < 0)
+		return err;
+	FLUX_LOG(FLUX_LOG_INFO, "entered OCI container filesystem\n");
+	return 0;
 }
 
 int flux_runc_prepare_container_fs(void)
@@ -738,7 +755,7 @@ int flux_runc_prepare_container_fs(void)
 		} else if (!strcmp(mount->type, "cgroup")) {
 			FLUX_LOG(
 				FLUX_LOG_INFO,
-				"skipping OCI cgroup mount at %s during container-fs setup\n",
+				"not exposing cgroupfs at %s inside Flux; host cgroup placement is enforced by flux-runc\n",
 				mount->destination);
 			continue;
 		}
@@ -778,18 +795,24 @@ int flux_runc_prepare_container_fs(void)
 	}
 
 	if (mounted_dev_tmpfs) {
+		FLUX_LOG(FLUX_LOG_INFO, "populating OCI /dev tmpfs\n");
 		err = flux_oci_populate_devtmpfs();
 		if (err < 0)
 			return err;
+		FLUX_LOG(FLUX_LOG_INFO, "populated OCI /dev tmpfs\n");
 	}
 
+	FLUX_LOG(FLUX_LOG_INFO, "ensuring OCI cwd\n");
 	err = flux_oci_ensure_container_cwd();
 	if (err < 0)
 		return err;
+	FLUX_LOG(FLUX_LOG_INFO, "ensured OCI cwd\n");
 
+	FLUX_LOG(FLUX_LOG_INFO, "applying OCI system path policies\n");
 	err = flux_oci_apply_linux_path_policies();
 	if (err < 0)
 		return err;
+	FLUX_LOG(FLUX_LOG_INFO, "applied OCI system path policies\n");
 
 	return 0;
 }

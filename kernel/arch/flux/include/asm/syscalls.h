@@ -3,70 +3,33 @@
 
 #include <asm-generic/syscalls.h>
 #include <uapi/asm/host_ops.h>
+#include <linux/types.h>
+#include <linux/sched.h>
 
 struct pt_regs;
+struct perf_event_attr;
 
 asmlinkage long sys_arch_prctl(int option, unsigned long arg2);
+asmlinkage long sys_flux_perf_event_open(
+		struct perf_event_attr __user *attr_uptr, pid_t pid, int cpu,
+		int group_fd, unsigned long flags);
+
 
 asmlinkage long host_syscall(long nr, ...);
 
-asmlinkage long sys_host_mmap(unsigned long addr, unsigned long len,
-			      unsigned long prot, unsigned long flags,
-			      unsigned long fd, unsigned long offset);
-asmlinkage long sys_host_mprotect(unsigned long start, unsigned long len,
-				  unsigned long prot);
-asmlinkage long sys_host_munmap(unsigned long start, unsigned long len);
-asmlinkage long sys_host_brk(unsigned long brk);
-asmlinkage long sys_host_mremap(unsigned long old_addr,
-			       unsigned long old_len, unsigned long new_len,
-			       unsigned long flags, unsigned long new_addr);
-asmlinkage long sys_host_msync(unsigned long start, unsigned long len,
-			      int flags);
-asmlinkage long sys_host_mincore(unsigned long start, unsigned long len,
-				 unsigned char __user *vec);
-asmlinkage long sys_host_madvise(unsigned long start, unsigned long len,
-				 int behavior);
-asmlinkage long sys_host_shmat(int shmid, char __user *shmaddr, int shmflg);
-asmlinkage long sys_host_shmget(int key, size_t size, int shmflg);
-asmlinkage long sys_host_shmctl(int shmid, int cmd, unsigned long buf);
-asmlinkage long sys_host_shmdt(char __user *shmaddr);
-asmlinkage long sys_host_mlock(unsigned long start, size_t len);
-asmlinkage long sys_host_munlock(unsigned long start, size_t len);
-asmlinkage long sys_host_mlockall(int flags);
-asmlinkage long sys_host_munlockall(void);
-asmlinkage long sys_host_mlock2(unsigned long start, size_t len, int flags);
-asmlinkage long sys_host_mbind(unsigned long start, unsigned long len,
-			      unsigned long mode,
-			      const unsigned long __user *nmask,
-			      unsigned long maxnode, unsigned int flags);
-asmlinkage long sys_host_swapon(const char __user *path, int flags);
-asmlinkage long sys_host_swapoff(const char __user *path);
 asmlinkage long sys_host_iopl(unsigned int level);
 asmlinkage long sys_host_ioperm(unsigned long from, unsigned long num,
-			       int turn_on);
-asmlinkage long
-sys_host_set_mempolicy(int mode, const unsigned long __user *nmask,
-			   unsigned long maxnode);
-asmlinkage long sys_host_get_mempolicy(int __user *policy,
-				       unsigned long __user *nmask,
-				       unsigned long maxnode,
-				       unsigned long addr,
-				       unsigned long flags);
-asmlinkage long sys_host_process_madvise(int pidfd, unsigned long vec,
-					unsigned long vlen, int behavior,
-					unsigned int flags);
-asmlinkage long sys_host_process_mrelease(int pidfd, unsigned int flags);
-asmlinkage long sys_host_execve(const char __user *filename,
-				const char __user *const __user *argv,
-				const char __user *const __user *envp);
-asmlinkage long sys_host_execveat(int fd, const char __user *filename,
-				  const char __user *const __user *argv,
-				  const char __user *const __user *envp,
-				  int flags);
-void flux_post_exec_to_user(void *entry, unsigned long stack);
-long flux_do_host_exec(const char *path, char **argv, char **envp);
-long flux_do_host_exec_with_post(const char *path, char **argv, char **envp,
-				 flux_post_exec_fn_t post_exec);
+				int turn_on);
+asmlinkage long sys_flux_madvise(unsigned long start, size_t len_in, int behavior);
+asmlinkage long sys_flux_pkey_mprotect(unsigned long start, size_t len,
+				       unsigned long prot, int pkey);
+asmlinkage long sys_flux_pkey_alloc(unsigned long flags,
+				    unsigned long init_val);
+asmlinkage long sys_flux_pkey_free(int pkey);
+asmlinkage long sys_flux_mprotect(unsigned long start, size_t len,
+				 unsigned long prot);
+asmlinkage long sys_flux_munmap(unsigned long addr, size_t len);
+extern const char *flux_elf_interpreter;
 
 #ifdef CONFIG_FLUX_FAST_NET
 

@@ -12,8 +12,12 @@
 #include <linux/memblock.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/smp.h>
 
 #include <asm/sections.h>
+#include <asm/host_ops.h>
+#include <asm/current.h>
+#include <asm/processor.h>
 
 struct pglist_data *node_data[MAX_NUMNODES] __read_mostly;
 EXPORT_SYMBOL(node_data);
@@ -23,8 +27,18 @@ static int cpu_to_node_map[NR_CPUS] = { [0 ... NR_CPUS - 1] = NUMA_NO_NODE };
 static int numa_distance_cnt;
 static u8 *numa_distance;
 bool numa_off;
+static bool flux_numa_emulation;
 
 int flux_max_nodes = 1;
+
+static int __init flux_numa_emulation_setup(char *opt)
+{
+	if (!IS_ENABLED(CONFIG_FLUX_NUMA_EMULATION))
+		return 0;
+
+	return kstrtobool(opt, &flux_numa_emulation);
+}
+early_param("flux_numa_emulation", flux_numa_emulation_setup);
 
 static __init int numa_parse_early_param(char *opt)
 {
@@ -188,8 +202,17 @@ void __init setup_per_cpu_areas(void)
 		panic("Failed to initialize percpu areas (err=%d).", rc);
 
 	delta = (unsigned long)pcpu_base_addr - (unsigned long)__per_cpu_start;
-	for_each_possible_cpu(cpu)
+	for_each_possible_cpu(cpu) {
 		__per_cpu_offset[cpu] = delta + pcpu_unit_offsets[cpu];
+		/* Flux-specific percpu finalization (mirrors arch/flux percpu.c). */
+		per_cpu(this_cpu_off, cpu) = __per_cpu_offset[cpu];
+		per_cpu(tls_pcpu.cpu_number, cpu) = cpu;
+
+		if (!cpu) {
+			per_cpu(tls_pcpu.host_tid, cpu) = flux_ops_gettid_raw();
+			wrgsbase(per_cpu_offset(cpu));
+		}
+	}
 }
 #endif
 
@@ -424,6 +447,54 @@ out_free_distance:
  */
 static int __init dummy_numa_init(void)
 {
+	phys_addr_t start, end, mid;
+	unsigned int cpu, ncpu;
+	int ret;
+
+	/*
+	 * An explicit numa= topology is authoritative. The optional virtual
+	 * topology is only a fallback for single-node environments.
+	 */
+	if (!nodes_empty(numa_nodes_parsed))
+		return 0;
+
+	start = memblock_start_of_DRAM();
+	end = memblock_end_of_DRAM();
+	if (!flux_numa_emulation || flux_max_nodes != 1) {
+		ret = numa_add_memblk(0, start, end);
+		if (ret)
+			return ret;
+		for_each_possible_cpu(cpu)
+			early_map_cpu_to_node(cpu, 0);
+		return 0;
+	}
+
+	mid = ALIGN(start + ((end - start) >> 1),
+		    1UL << SECTION_SIZE_BITS);
+	if (mid <= start || mid >= end) {
+		ret = numa_add_memblk(0, start, end);
+		if (ret)
+			return ret;
+		for_each_possible_cpu(cpu)
+			early_map_cpu_to_node(cpu, 0);
+		node_set(0, numa_nodes_parsed);
+		return 0;
+	}
+
+	ret = numa_add_memblk(0, start, mid);
+	if (ret)
+		return ret;
+	ret = numa_add_memblk(1, mid, end);
+	if (ret)
+		return ret;
+
+	ncpu = num_possible_cpus();
+	for_each_possible_cpu(cpu)
+		early_map_cpu_to_node(cpu, cpu < DIV_ROUND_UP(ncpu, 2) ? 0 : 1);
+
+	node_set(0, numa_nodes_parsed);
+	node_set(1, numa_nodes_parsed);
+	pr_info("using two-node virtual topology\n");
 	return 0;
 }
 

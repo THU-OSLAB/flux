@@ -373,10 +373,7 @@ extern unsigned int flux_xstate_copy_size;
 
 /* These macros all use (%edi)/(%rdi) as the single memory argument. */
 #define XSAVE ".byte " REX_PREFIX "0x0f,0xae,0x27"
-#define XSAVEOPT ".byte " REX_PREFIX "0x0f,0xae,0x37"
-#define XSAVES ".byte " REX_PREFIX "0x0f,0xc7,0x2f"
 #define XRSTOR ".byte " REX_PREFIX "0x0f,0xae,0x2f"
-#define XRSTORS ".byte " REX_PREFIX "0x0f,0xc7,0x1f"
 
 /*
  * After this @err contains 0 on success or the trap number when the
@@ -392,50 +389,58 @@ extern unsigned int flux_xstate_copy_size;
 		     : "memory")
 
 /*
- * Use XRSTORS to restore context if it is enabled. XRSTORS supports compact
- * XSAVE area format.
+ * Save a self-contained image when there is no guarantee that the destination
+ * contains the previous state associated with the live hardware registers.
  */
-#define XSTATE_XSAVE(st, lmask, hmask, err)                      \
-	asm volatile(XSAVEOPT "\n"                               \
-		     :                                           \
-		     : "D"(st), "m"(*st), "a"(lmask), "d"(hmask) \
-		     : "memory")
-
-#define XSTATE_XRESTORE(st, lmask, hmask)                        \
-	asm volatile(XRSTOR                                      \
-		     :                                           \
-		     : "D"(st), "m"(*st), "a"(lmask), "d"(hmask) \
-		     : "memory")
-
-static __always_inline void save_xstate(struct xregs_state *xstate)
+static __always_inline void save_xstate_full(struct xregs_state *xstate)
 {
 	int err;
 	u64 mask = FLUX_XSAVE_MASK;
-	XSTATE_OP(XSAVEOPT, xstate, (u32)mask, (u32)(mask >> 32), err);
+
+	XSTATE_OP(XSAVE, xstate, (u32)mask, (u32)(mask >> 32), err);
 	WARN_ON_ONCE(err);
 }
 
-static __always_inline void restore_xstate(struct xregs_state *xstate)
+static __always_inline bool xstate_header_valid(const struct xregs_state *xstate)
 {
 	u64 mask = FLUX_XSAVE_MASK;
-	XSTATE_XRESTORE(xstate, (u32)mask, (u32)(mask >> 32));
+	int i;
+
+	if (xstate->header.xfeatures & ~mask)
+		return false;
+	if (xstate->header.xcomp_bv)
+		return false;
+	for (i = 0; i < ARRAY_SIZE(xstate->header.reserved); i++) {
+		if (xstate->header.reserved[i])
+			return false;
+	}
+
+	return true;
+}
+
+static __always_inline int restore_xstate(struct xregs_state *xstate)
+{
+	int err;
+	u64 mask = FLUX_XSAVE_MASK;
+
+	if (unlikely(!xstate_header_valid(xstate)))
+		return -1;
+
+	/*
+	 * XRSTOR raises #GP for malformed MXCSR or component data.  In Flux that
+	 * arrives as a host SIGSEGV with SI_KERNEL, so the raw instruction would
+	 * be mistaken for a Flux page fault and retried forever.  Keep the
+	 * instruction in the exception table just like XSAVE and let the caller
+	 * fall back to the clean initial state.
+	 */
+	XSTATE_OP(XRSTOR, xstate, (u32)mask, (u32)(mask >> 32), err);
+	return err ? -1 : 0;
 }
 
 
-#ifdef CONFIG_FLUX_UINTR
 
 extern void kernel_fpu_begin(void);
 extern void kernel_fpu_end(void);
 
-#else /* !CONFIG_FLUX_UINTR */
-static inline void kernel_fpu_begin(void)
-{
-	/* No need to do anything here, FPU is always enabled */
-}
-static inline void kernel_fpu_end(void)
-{
-	/* No need to do anything here, FPU is always enabled */
-}
-#endif /* CONFIG_FLUX_UINTR */
 
 #endif /* _ASM_X86_FPU_H */

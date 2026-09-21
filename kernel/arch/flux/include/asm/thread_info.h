@@ -47,13 +47,21 @@ struct thread_info {
 #define TIF_NEED_RESCHED	3	/* rescheduling necessary */
 #define TIF_USER 			10  /* kthread created by user */
 #define TIF_NEED_FPU_LOAD	11	/* load FPU */
-#define TIF_UINTR_FROM_USER 12  /* uintr from user */
+#define TIF_POLLING_NRFLAG	16	/* idle polls TIF_NEED_RESCHED */
 #define TIF_NOTIFY_SIGNAL	17	/* signal notifications exist */
 #define TIF_MEMDIE			20	/* is terminating due to OOM killer */
+#define TIF_NOTSC			21	/* RDTSC should fault in userspace */
 
 #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
 #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
 #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
+#define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
 #define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+#define _TIF_NOTSC		(1 << TIF_NOTSC)
+
+#ifndef __ASSEMBLY__
+void disable_TSC(void);
+void enable_TSC(void);
+#endif
 
 #endif

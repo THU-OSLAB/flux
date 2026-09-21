@@ -1,0 +1,116 @@
+Subject: [PATCH] mm: preserve active Flux rewrite mappings during reclaim
+
+Protect the temporary architecture projection before background PTE aging,
+reclaim, migration, and KSM replacement. Other architectures retain existing
+behavior. This fixes Linux 6.6 functionality and adds no new UAPI.
+
+--- a/kernel/include/linux/pgtable.h
++++ b/kernel/include/linux/pgtable.h
+@@ -873,6 +873,16 @@
+ }
+ #endif
+ 
++/* Checked under the page-table lock before a background PTE replacement. */
++#ifndef arch_preserve_user_mapping
++static inline bool arch_preserve_user_mapping(struct mm_struct *mm,
++					     unsigned long start,
++					     unsigned long end)
++{
++	return false;
++}
++#endif
++
+ #ifndef __HAVE_ARCH_UNMAP_ONE
+ /*
+  * Some architectures support metadata associated with a page. When a
+--- a/kernel/mm/rmap.c
++++ b/kernel/mm/rmap.c
+@@ -810,6 +810,13 @@
+ 
+ 	while (page_vma_mapped_walk(&pvmw)) {
+ 		address = pvmw.address;
++		if (arch_preserve_user_mapping(vma->vm_mm, address,
++					      address + folio_size(folio))) {
++			/* Temporary architecture preservation, without setting mlock. */
++			page_vma_mapped_walk_done(&pvmw);
++			pra->vm_flags |= VM_LOCKED;
++			return false;
++		}
+ 
+ 		if ((vma->vm_flags & VM_LOCKED) &&
+ 		    (!folio_test_large(folio) || !pvmw.pte)) {
+@@ -1519,6 +1526,14 @@
+ 	mmu_notifier_invalidate_range_start(&range);
+ 
+ 	while (page_vma_mapped_walk(&pvmw)) {
++		/* This architecture still needs the current hardware projection. */
++		if (arch_preserve_user_mapping(mm, pvmw.address,
++					      pvmw.address + folio_size(folio))) {
++			page_vma_mapped_walk_done(&pvmw);
++			ret = false;
++			break;
++		}
++
+ 		/* Unexpected PMD-mapped THP? */
+ 		VM_BUG_ON_FOLIO(!pvmw.pte, folio);
+ 
+@@ -1868,6 +1883,14 @@
+ 	mmu_notifier_invalidate_range_start(&range);
+ 
+ 	while (page_vma_mapped_walk(&pvmw)) {
++		/* This architecture still needs the current hardware projection. */
++		if (arch_preserve_user_mapping(mm, pvmw.address,
++					      pvmw.address + folio_size(folio))) {
++			page_vma_mapped_walk_done(&pvmw);
++			ret = false;
++			break;
++		}
++
+ #ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
+ 		/* PMD-mapped THP migration entry */
+ 		if (!pvmw.pte) {
+--- a/kernel/mm/ksm.c
++++ b/kernel/mm/ksm.c
+@@ -1118,6 +1118,10 @@
+ 	if (WARN_ONCE(!pvmw.pte, "Unexpected PMD mapping?"))
+ 		goto out_unlock;
+ 
++	if (arch_preserve_user_mapping(mm, pvmw.address,
++				      pvmw.address + PAGE_SIZE))
++		goto out_unlock;
++
+ 	anon_exclusive = PageAnonExclusive(page);
+ 	entry = ptep_get(pvmw.pte);
+ 	if (pte_write(entry) || pte_dirty(entry) ||
+@@ -1220,7 +1224,8 @@
+ 	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+ 	if (!ptep)
+ 		goto out_mn;
+-	if (!pte_same(ptep_get(ptep), orig_pte)) {
++	if (arch_preserve_user_mapping(mm, addr, addr + PAGE_SIZE) ||
++	    !pte_same(ptep_get(ptep), orig_pte)) {
+ 		pte_unmap_unlock(ptep, ptl);
+ 		goto out_mn;
+ 	}
+--- a/kernel/mm/madvise.c
++++ b/kernel/mm/madvise.c
+@@ -370,6 +370,9 @@
+ 		if (!ptl)
+ 			return 0;
+ 
++		if (arch_preserve_user_mapping(mm, addr, next))
++			goto huge_unlock;
++
+ 		orig_pmd = *pmd;
+ 		if (is_huge_zero_pmd(orig_pmd))
+ 			goto huge_unlock;
+@@ -440,6 +443,9 @@
+ 	flush_tlb_batched_pending(mm);
+ 	arch_enter_lazy_mmu_mode();
+ 	for (; addr < end; pte++, addr += PAGE_SIZE) {
++		if (arch_preserve_user_mapping(mm, addr, addr + PAGE_SIZE))
++			continue;
++
+ 		ptent = ptep_get(pte);
+ 
+ 		if (pte_none(ptent))

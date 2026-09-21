@@ -1,6 +1,7 @@
 #define FLUX_FMT "flux: "
 
 #include <string.h>
+#include <stdio.h>
 #include <sys/prctl.h>
 
 #include <kernel/linux/capability.h>
@@ -18,6 +19,214 @@ int flux_apply_oci_process_state(void)
 }
 
 #else
+
+#define FLUX_OCI_CGROUP_ROOT "/sys/fs/cgroup"
+#define FLUX_OCI_CGROUP_LEAF "/sys/fs/cgroup/flux-oci"
+
+static int flux_oci_resource_write(const char *path, const char *value)
+{
+	int fd;
+	int ret;
+
+	fd = flux_sys_open(path, FLUX_O_WRONLY, 0);
+	if (fd < 0)
+		return fd;
+	ret = flux_sys_write(fd, value, strlen(value));
+	if (ret >= 0 && (size_t)ret != strlen(value))
+		ret = -FLUX_EIO;
+	else if (ret >= 0)
+		ret = 0;
+	if (flux_sys_close(fd) < 0 && ret == 0)
+		ret = -FLUX_EIO;
+	return ret;
+}
+
+static int flux_oci_resource_write_i64(const char *name, int64_t value,
+				       bool max_for_negative)
+{
+	char path[256];
+	char buf[64];
+
+	if (snprintf(path, sizeof(path), "%s/%s", FLUX_OCI_CGROUP_LEAF,
+		     name) >= (int)sizeof(path))
+		return -FLUX_ENAMETOOLONG;
+	if (value < 0 && max_for_negative)
+		snprintf(buf, sizeof(buf), "max\n");
+	else
+		snprintf(buf, sizeof(buf), "%lld\n", (long long)value);
+	return flux_oci_resource_write(path, buf);
+}
+
+static int flux_oci_resource_write_u64(const char *name, uint64_t value)
+{
+	char path[256];
+	char buf[64];
+
+	if (snprintf(path, sizeof(path), "%s/%s", FLUX_OCI_CGROUP_LEAF,
+		     name) >= (int)sizeof(path))
+		return -FLUX_ENAMETOOLONG;
+	snprintf(buf, sizeof(buf), "%llu\n", (unsigned long long)value);
+	return flux_oci_resource_write(path, buf);
+}
+
+static uint64_t flux_oci_cpu_weight(uint64_t shares)
+{
+	if (shares == 0)
+		return 100;
+	if (shares < 2)
+		shares = 2;
+	if (shares > 262144)
+		shares = 262144;
+	return 1 + ((shares - 2) * 9999) / 262142;
+}
+
+static int flux_oci_enable_controller(const char *name)
+{
+	char value[64];
+
+	if (snprintf(value, sizeof(value), "+%s\n", name) >=
+	    (int)sizeof(value))
+		return -FLUX_EOVERFLOW;
+	return flux_oci_resource_write(
+		FLUX_OCI_CGROUP_ROOT "/cgroup.subtree_control", value);
+}
+
+static int flux_oci_apply_internal_memory(
+	const struct flux_oci_memory_resources *memory)
+{
+	int ret;
+
+	if (memory->has_limit) {
+		ret = flux_oci_resource_write_i64("memory.max", memory->limit,
+						  true);
+		if (ret < 0)
+			return ret;
+	}
+	if (memory->has_reservation) {
+		ret = flux_oci_resource_write_i64(
+			"memory.low",
+			memory->reservation < 0 ? 0 : memory->reservation, false);
+		if (ret < 0)
+			return ret;
+	}
+	if (memory->has_swap) {
+		int64_t swap = memory->swap;
+
+		if (swap >= 0 && memory->has_limit && memory->limit >= 0) {
+			if (swap < memory->limit)
+				return -FLUX_EINVAL;
+			swap -= memory->limit;
+		} else if (swap >= 0 && !memory->has_limit) {
+			return -FLUX_EINVAL;
+		}
+		ret = flux_oci_resource_write_i64("memory.swap.max", swap, true);
+		if (ret < 0)
+			return ret;
+	}
+	return 0;
+}
+
+static int flux_oci_apply_internal_cpu(
+	const struct flux_oci_cpu_resources *cpu)
+{
+	char value[128];
+	uint64_t period;
+	int ret;
+
+	if (cpu->has_shares) {
+		ret = flux_oci_resource_write_u64(
+			"cpu.weight", flux_oci_cpu_weight(cpu->shares));
+		if (ret < 0)
+			return ret;
+	}
+	if (cpu->has_quota || cpu->has_period) {
+		period = cpu->has_period && cpu->period ? cpu->period : 100000;
+		if (cpu->has_quota && cpu->quota >= 0)
+			snprintf(value, sizeof(value), "%lld %llu\n",
+				 (long long)cpu->quota,
+				 (unsigned long long)period);
+		else
+			snprintf(value, sizeof(value), "max %llu\n",
+				 (unsigned long long)period);
+		ret = flux_oci_resource_write(FLUX_OCI_CGROUP_LEAF "/cpu.max",
+					      value);
+		if (ret < 0)
+			return ret;
+	}
+	if (cpu->has_burst) {
+		ret = flux_oci_resource_write_u64("cpu.max.burst", cpu->burst);
+		if (ret < 0)
+			return ret;
+	}
+	if (cpu->has_idle) {
+		ret = flux_oci_resource_write_i64("cpu.idle", cpu->idle, false);
+		if (ret < 0)
+			return ret;
+	}
+	return 0;
+}
+
+static int flux_apply_oci_internal_resources(const struct flux_oci_cfg *oci)
+{
+	const struct flux_oci_resources *resources;
+	unsigned long flags = FLUX_MS_NOSUID | FLUX_MS_NODEV | FLUX_MS_NOEXEC;
+	int ret;
+
+	if (!oci)
+		return 0;
+	resources = &oci->resources;
+	ret = flux_sys_mkdir("/sys", 0755);
+	if (ret < 0 && ret != -FLUX_EEXIST)
+		return ret;
+	ret = flux_sys_mkdir("/sys/fs", 0755);
+	if (ret < 0 && ret != -FLUX_EEXIST)
+		return ret;
+	ret = flux_sys_mkdir(FLUX_OCI_CGROUP_ROOT, 0755);
+	if (ret < 0 && ret != -FLUX_EEXIST)
+		return ret;
+
+	ret = flux_sys_mount("none", FLUX_OCI_CGROUP_ROOT, "cgroup2", flags,
+			     NULL);
+	if (ret < 0)
+		return ret;
+	ret = flux_oci_enable_controller("memory");
+	if (ret < 0)
+		return ret;
+	ret = flux_oci_enable_controller("cpu");
+	if (ret < 0)
+		return ret;
+	ret = flux_oci_enable_controller("pids");
+	if (ret < 0)
+		return ret;
+	ret = flux_sys_mkdir(FLUX_OCI_CGROUP_LEAF, 0755);
+	if (ret < 0 && ret != -FLUX_EEXIST)
+		return ret;
+
+	/* Move init first so pids.max=0 remains a valid no-new-task limit. */
+	ret = flux_oci_resource_write(FLUX_OCI_CGROUP_LEAF "/cgroup.procs",
+				      "0\n");
+	if (ret < 0)
+		return ret;
+	if (resources->has_memory) {
+		ret = flux_oci_apply_internal_memory(&resources->memory);
+		if (ret < 0)
+			return ret;
+	}
+	if (resources->has_cpu) {
+		ret = flux_oci_apply_internal_cpu(&resources->cpu);
+		if (ret < 0)
+			return ret;
+	}
+	if (resources->has_pids && resources->pids.has_limit) {
+		ret = flux_oci_resource_write_i64(
+			"pids.max", resources->pids.limit, true);
+		if (ret < 0)
+			return ret;
+	}
+
+	/* The host cgroup remains the non-bypassable outer hard limit. */
+	return 0;
+}
 
 static int flux_apply_oci_capabilities(const struct flux_oci_cfg *oci)
 {
@@ -102,13 +311,18 @@ static int flux_apply_oci_user(const struct flux_oci_cfg *oci)
 	if (!oci || (!oci->user.has_uid && !oci->user.has_gid))
 		return 0;
 
-	if (oci->user.has_gid) {
-		ret = flux_sys_setgroups(0, NULL);
+	if (oci->user.has_gid || oci->user.additional_gid_num > 0) {
+		ret = flux_sys_setgroups(oci->user.additional_gid_num,
+					 oci->user.additional_gids);
 		if (ret < 0) {
-			FLUX_LOG(FLUX_LOG_ERR, "OCI setgroups(0) failed: %s\n",
-				 flux_strerror(-ret));
+			FLUX_LOG(FLUX_LOG_ERR,
+				 "OCI setgroups(%d) failed: %s\n",
+				 oci->user.additional_gid_num, flux_strerror(-ret));
 			return ret;
 		}
+	}
+
+	if (oci->user.has_gid) {
 		ret = flux_sys_setresgid(oci->user.gid, oci->user.gid,
 					 oci->user.gid);
 		if (ret < 0) {
@@ -158,6 +372,27 @@ static int flux_apply_oci_rlimits(const struct flux_oci_cfg *oci)
 	return 0;
 }
 
+static int flux_apply_oci_sysctls(const struct flux_oci_cfg *oci)
+{
+	int i;
+
+	if (!oci)
+		return 0;
+	for (i = 0; i < oci->sysctl_num; i++) {
+		int ret = flux_sysctl(oci->sysctls[i].name,
+				      oci->sysctls[i].value);
+
+		if (ret < 0) {
+			FLUX_LOG(FLUX_LOG_ERR,
+				 "OCI sysctl %s=%s failed: %s\n",
+				 oci->sysctls[i].name, oci->sysctls[i].value,
+				 flux_strerror(-ret));
+			return ret;
+		}
+	}
+	return 0;
+}
+
 static bool flux_oci_has_capability_settings(const struct flux_oci_cfg *oci)
 {
 	if (!oci)
@@ -178,7 +413,19 @@ int flux_apply_oci_process_state(void)
 	if (!oci)
 		return 0;
 
+	FLUX_LOG(FLUX_LOG_INFO, "applying OCI process state\n");
+	FLUX_LOG(FLUX_LOG_INFO, "applying OCI Flux resource controls\n");
+	err = flux_apply_oci_internal_resources(oci);
+	if (err < 0)
+		return err;
+	FLUX_LOG(FLUX_LOG_INFO, "applying OCI sysctls\n");
+	err = flux_apply_oci_sysctls(oci);
+	if (err < 0)
+		return err;
+	FLUX_LOG(FLUX_LOG_INFO, "applied OCI sysctls\n");
+
 	if (oci->hostname) {
+		FLUX_LOG(FLUX_LOG_INFO, "applying OCI hostname\n");
 		err = flux_sys_sethostname(oci->hostname,
 					   strlen(oci->hostname));
 		if (err < 0) {
@@ -190,6 +437,7 @@ int flux_apply_oci_process_state(void)
 	}
 
 	if (oci->cwd) {
+		FLUX_LOG(FLUX_LOG_INFO, "applying OCI cwd\n");
 		err = flux_sys_chdir(oci->cwd);
 		if (err < 0) {
 			FLUX_LOG(FLUX_LOG_ERR, "OCI chdir(%s) failed: %s\n",
@@ -211,10 +459,12 @@ int flux_apply_oci_process_state(void)
 		}
 	}
 
+	FLUX_LOG(FLUX_LOG_INFO, "applying OCI user\n");
 	err = flux_apply_oci_user(oci);
 	if (err < 0)
 		return err;
 
+	FLUX_LOG(FLUX_LOG_INFO, "applying OCI capabilities\n");
 	err = flux_apply_oci_capabilities(oci);
 	if (err < 0)
 		return err;
@@ -229,11 +479,13 @@ int flux_apply_oci_process_state(void)
 		}
 	}
 
+	FLUX_LOG(FLUX_LOG_INFO, "applying OCI rlimits\n");
 	err = flux_apply_oci_rlimits(oci);
 	if (err < 0)
 		return err;
 
 	if (oci->no_new_privileges) {
+		FLUX_LOG(FLUX_LOG_INFO, "applying OCI no-new-privileges\n");
 		err = flux_sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 		if (err < 0) {
 			FLUX_LOG(FLUX_LOG_ERR,
@@ -243,6 +495,7 @@ int flux_apply_oci_process_state(void)
 		}
 	}
 
+	FLUX_LOG(FLUX_LOG_INFO, "applied OCI process state\n");
 	return 0;
 }
 

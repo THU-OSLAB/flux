@@ -89,7 +89,14 @@ static void *__mem_map_common(void *base, size_t len, size_t pgsize, int flags,
 void *flux_mem_map_anom(void *base, size_t len, size_t pgsize, int node)
 {
 	unsigned long mask = (1 << node);
-	return __mem_map_common(base, len, pgsize, MAP_PRIVATE, -1, &mask,
+	/*
+	 * This is Flux physical memory, not per-host-process state.  Flux
+	 * duplicates host mms to run Flux processes, while Flux page tables
+	 * implement the actual fork COW.  Keep the direct map shared across those
+	 * host mms so a second host-private COW layer cannot diverge from PFNMAP
+	 * user aliases.
+	 */
+	return __mem_map_common(base, len, pgsize, MAP_SHARED, -1, &mask,
 				MPOL_BIND);
 }
 

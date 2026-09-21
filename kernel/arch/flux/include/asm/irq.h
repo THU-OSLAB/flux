@@ -7,11 +7,4 @@
 #define FLUX_IRQ_BASE (NR_IRQS - 128)
 #define FLUX_IRQ_IPI FLUX_IRQ_BASE
 
-void flux_run_irqs(void);
-
-void flux_ipi(void);
-void flux_scheduler_ipi(void);
-
-#include <uapi/asm/irq.h>
-
 #endif

@@ -1,2 +1,4 @@
-iokd-y += main.o config.o kmod.o uintr.o client.o timer.o
-iokd-$(CONFIG_FLUX_FNET) += fnet.o dma.o rx.o tx.o
+iokd-y += main.o config.o kmod.o uintr.o timer.o
+iokd-y += client/core.o client/control.o client/socket.o
+iokd-$(CONFIG_FLUX_FNET) += dma.o
+iokd-$(CONFIG_FLUX_FNET) += fnet/core.o fnet/rx.o fnet/tx.o fnet/mlx5.o

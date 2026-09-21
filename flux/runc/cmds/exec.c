@@ -35,6 +35,8 @@ struct flux_runc_exec_session {
 	pid_t stdin_pid;
 	pid_t stdout_pid;
 	pid_t stderr_pid;
+	int tty_master_fd;
+	int tty_slave_fd;
 };
 
 static void flux_runc_exec_spec_fini(struct flux_runc_exec_spec *spec)
@@ -102,6 +104,74 @@ static int flux_runc_exec_write_pid_file(const char *path, pid_t pid)
 
 	if (close(fd) < 0)
 		return -errno;
+
+	return 0;
+}
+
+static int flux_runc_exec_proxy_read_status(int fd, int *status)
+{
+	char *pos = (char *)status;
+	size_t left = sizeof(*status);
+
+	while (left > 0) {
+		ssize_t nr = read(fd, pos, left);
+
+		if (nr < 0) {
+			if (errno == EINTR)
+				continue;
+			return -errno;
+		}
+		if (nr == 0)
+			return -EPIPE;
+		pos += nr;
+		left -= (size_t)nr;
+	}
+
+	return 0;
+}
+
+static void flux_runc_exec_proxy_notify(int *fd, int status)
+{
+	const char *pos = (const char *)&status;
+	size_t left = sizeof(status);
+
+	if (!fd || *fd < 0)
+		return;
+
+	while (left > 0) {
+		ssize_t nw = write(*fd, pos, left);
+
+		if (nw < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		pos += nw;
+		left -= (size_t)nw;
+	}
+
+	close(*fd);
+	*fd = -1;
+}
+
+static int flux_runc_exec_proxy_detach_stdio(void)
+{
+	int nullfd;
+
+	nullfd = open("/dev/null", O_RDWR | O_CLOEXEC);
+	if (nullfd < 0)
+		return -errno;
+
+	if (dup2(nullfd, STDIN_FILENO) < 0 ||
+	    dup2(nullfd, STDOUT_FILENO) < 0 ||
+	    dup2(nullfd, STDERR_FILENO) < 0) {
+		int ret = -errno;
+
+		close(nullfd);
+		return ret;
+	}
+	if (nullfd > STDERR_FILENO)
+		close(nullfd);
 
 	return 0;
 }
@@ -231,13 +301,76 @@ static int flux_runc_exec_token_skip(const jsmntok_t *tokens, int index)
 	}
 }
 
+static int flux_runc_exec_hex_digit(char ch)
+{
+	if (ch >= '0' && ch <= '9')
+		return ch - '0';
+	if (ch >= 'a' && ch <= 'f')
+		return ch - 'a' + 10;
+	if (ch >= 'A' && ch <= 'F')
+		return ch - 'A' + 10;
+	return -1;
+}
+
+static int flux_runc_exec_parse_hex4(const char *value,
+				     unsigned int *codepoint)
+{
+	unsigned int result = 0;
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		int digit = flux_runc_exec_hex_digit(value[i]);
+
+		if (digit < 0)
+			return -EINVAL;
+		result = (result << 4) | (unsigned int)digit;
+	}
+	*codepoint = result;
+	return 0;
+}
+
+static int flux_runc_exec_append_utf8(char *dst, size_t capacity,
+				      size_t *offset,
+				      unsigned int codepoint)
+{
+	if (codepoint == 0 || codepoint > 0x10ffff ||
+	    (codepoint >= 0xd800 && codepoint <= 0xdfff))
+		return -EINVAL;
+	if (codepoint <= 0x7f) {
+		if (*offset + 1 >= capacity)
+			return -E2BIG;
+		dst[(*offset)++] = (char)codepoint;
+	} else if (codepoint <= 0x7ff) {
+		if (*offset + 2 >= capacity)
+			return -E2BIG;
+		dst[(*offset)++] = (char)(0xc0 | (codepoint >> 6));
+		dst[(*offset)++] = (char)(0x80 | (codepoint & 0x3f));
+	} else if (codepoint <= 0xffff) {
+		if (*offset + 3 >= capacity)
+			return -E2BIG;
+		dst[(*offset)++] = (char)(0xe0 | (codepoint >> 12));
+		dst[(*offset)++] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+		dst[(*offset)++] = (char)(0x80 | (codepoint & 0x3f));
+	} else {
+		if (*offset + 4 >= capacity)
+			return -E2BIG;
+		dst[(*offset)++] = (char)(0xf0 | (codepoint >> 18));
+		dst[(*offset)++] = (char)(0x80 | ((codepoint >> 12) & 0x3f));
+		dst[(*offset)++] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+		dst[(*offset)++] = (char)(0x80 | (codepoint & 0x3f));
+	}
+	return 0;
+}
+
 static int flux_runc_exec_token_str(const char *json, const jsmntok_t *tok,
 				    char **out)
 {
+	size_t in;
 	size_t len;
+	size_t offset = 0;
 	char *copy;
 
-	if (!tok || tok->type != JSMN_STRING)
+	if (!tok || tok->type != JSMN_STRING || !out)
 		return -EINVAL;
 
 	len = (size_t)(tok->end - tok->start);
@@ -245,11 +378,79 @@ static int flux_runc_exec_token_str(const char *json, const jsmntok_t *tok,
 	if (!copy)
 		return -ENOMEM;
 
-	memcpy(copy, json + tok->start, len);
-	copy[len] = '\0';
+	for (in = 0; in < len; in++) {
+		char ch = json[tok->start + (int)in];
+
+		if (ch != '\\') {
+			copy[offset++] = ch;
+			continue;
+		}
+		if (++in >= len)
+			goto invalid;
+		ch = json[tok->start + (int)in];
+		switch (ch) {
+		case '"':
+		case '\\':
+		case '/':
+			copy[offset++] = ch;
+			break;
+		case 'b':
+			copy[offset++] = '\b';
+			break;
+		case 'f':
+			copy[offset++] = '\f';
+			break;
+		case 'n':
+			copy[offset++] = '\n';
+			break;
+		case 'r':
+			copy[offset++] = '\r';
+			break;
+		case 't':
+			copy[offset++] = '\t';
+			break;
+		case 'u': {
+			unsigned int codepoint;
+
+			if (in + 4 >= len ||
+			    flux_runc_exec_parse_hex4(
+				    json + tok->start + (int)in + 1,
+				    &codepoint) < 0)
+				goto invalid;
+			in += 4;
+			if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
+				unsigned int low;
+
+				if (in + 6 >= len ||
+				    json[tok->start + (int)in + 1] != '\\' ||
+				    json[tok->start + (int)in + 2] != 'u' ||
+				    flux_runc_exec_parse_hex4(
+					    json + tok->start + (int)in + 3,
+					    &low) < 0 ||
+				    low < 0xdc00 || low > 0xdfff)
+					goto invalid;
+				codepoint = 0x10000 +
+					    ((codepoint - 0xd800) << 10) +
+					    (low - 0xdc00);
+				in += 6;
+			}
+			if (flux_runc_exec_append_utf8(copy, len + 1, &offset,
+						       codepoint) < 0)
+				goto invalid;
+			break;
+		}
+		default:
+			goto invalid;
+		}
+	}
+	copy[offset] = '\0';
 	free(*out);
 	*out = copy;
 	return 0;
+
+invalid:
+	free(copy);
+	return -EINVAL;
 }
 
 static int flux_runc_exec_parse_int(const char *json, const jsmntok_t *tok,
@@ -296,6 +497,48 @@ static int flux_runc_exec_parse_bool(const char *json, const jsmntok_t *tok,
 	}
 
 	return -EINVAL;
+}
+
+static int flux_runc_exec_parse_console_size(
+	const char *json, const jsmntok_t *tokens, int index,
+	struct flux_runc_exec_spec *spec)
+{
+	bool width_seen = false;
+	bool height_seen = false;
+	int tok = index + 1;
+	int i;
+
+	if (tokens[index].type != JSMN_OBJECT)
+		return -EINVAL;
+
+	for (i = 0; i < tokens[index].size; i++) {
+		int key = tok;
+		int value = key + 1;
+		unsigned int parsed;
+		int ret = 0;
+
+		if (flux_runc_exec_token_eq(json, &tokens[key], "width")) {
+			ret = flux_runc_exec_parse_int(json, &tokens[value], &parsed);
+			if (ret < 0 || parsed > USHRT_MAX)
+				return -EINVAL;
+			spec->console_width = parsed;
+			width_seen = true;
+		} else if (flux_runc_exec_token_eq(json, &tokens[key],
+						  "height")) {
+			ret = flux_runc_exec_parse_int(json, &tokens[value], &parsed);
+			if (ret < 0 || parsed > USHRT_MAX)
+				return -EINVAL;
+			spec->console_height = parsed;
+			height_seen = true;
+		}
+
+		tok = flux_runc_exec_token_skip(tokens, value);
+	}
+
+	if (!width_seen || !height_seen)
+		return -EINVAL;
+	spec->has_console_size = true;
+	return 0;
 }
 
 static int flux_runc_exec_parse_string_array(const char *json,
@@ -440,6 +683,10 @@ static int flux_runc_exec_parse_process_json(const char *path,
 						   "terminal")) {
 			ret = flux_runc_exec_parse_bool(json, &tokens[value],
 						       &spec->terminal);
+		} else if (flux_runc_exec_token_eq(json, &tokens[key],
+						   "consoleSize")) {
+			ret = flux_runc_exec_parse_console_size(
+				json, tokens, value, spec);
 		} else if (flux_runc_exec_token_eq(json, &tokens[key],
 						   "user")) {
 			int utok = value + 1;
@@ -717,6 +964,8 @@ static int flux_runc_exec_apply_cli(const struct flux_runc_exec_cmd *cmd,
 
 	if (spec->argc <= 0 || !spec->argv || !spec->argv[0])
 		return -EINVAL;
+	if (spec->has_console_size && !spec->terminal)
+		return -EINVAL;
 
 	if (!spec->cwd) {
 		ret = flux_runc_exec_strdup(&spec->cwd, "/");
@@ -728,7 +977,6 @@ static int flux_runc_exec_apply_cli(const struct flux_runc_exec_cmd *cmd,
 	if (ret < 0)
 		return ret;
 
-	spec->detach = cmd->detach && !cmd->process_path;
 	return 0;
 }
 
@@ -862,10 +1110,27 @@ static int flux_runc_exec_session_spawn_bridge(const char *path, int stdio_fd,
 
 static void flux_runc_exec_session_reap_pid(pid_t *pid)
 {
+	struct timespec req = {
+		.tv_sec = 0,
+		.tv_nsec = 10 * 1000 * 1000,
+	};
 	int status;
+	int waited_ms;
 
 	if (!pid || *pid <= 0)
 		return;
+
+	for (waited_ms = 0; waited_ms < 1000; waited_ms += 10) {
+		pid_t ret = waitpid(*pid, &status, WNOHANG);
+
+		if (ret == *pid || (ret < 0 && errno == ECHILD)) {
+			*pid = 0;
+			return;
+		}
+		if (ret < 0 && errno != EINTR)
+			break;
+		nanosleep(&req, NULL);
+	}
 
 	kill(*pid, SIGTERM);
 	while (waitpid(*pid, &status, 0) < 0) {
@@ -889,9 +1154,14 @@ static void flux_runc_exec_session_destroy(struct flux_runc_exec_session *sessio
 	if (!session || !session->active)
 		return;
 
-	flux_runc_exec_session_reap_pid(&session->stdin_pid);
 	flux_runc_exec_session_reap_pid(&session->stdout_pid);
 	flux_runc_exec_session_reap_pid(&session->stderr_pid);
+	flux_runc_exec_session_reap_pid(&session->stdin_pid);
+
+	if (session->tty_master_fd >= 0)
+		close(session->tty_master_fd);
+	if (session->tty_slave_fd >= 0)
+		close(session->tty_slave_fd);
 
 	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
 		if (flux_runc_exec_session_path(session->dir, names[i], path,
@@ -985,25 +1255,38 @@ static int flux_runc_exec_session_create(const struct flux_runc_state *state,
 		spec->session_id = id;
 
 		if (spec->terminal) {
-			if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO) ||
-			    !isatty(STDERR_FILENO)) {
+			pid_t tty_pid = getpid();
+			int tty_fds[3] = {
+				session->tty_slave_fd,
+				session->tty_slave_fd,
+				session->tty_slave_fd,
+			};
+
+			if (session->tty_slave_fd < 0 &&
+			    (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO) ||
+			     !isatty(STDERR_FILENO))) {
 				ret = -ENOTTY;
 				goto err;
+			}
+			if (session->tty_slave_fd < 0) {
+				tty_fds[0] = STDIN_FILENO;
+				tty_fds[1] = STDOUT_FILENO;
+				tty_fds[2] = STDERR_FILENO;
 			}
 
 			ret = flux_runc_exec_session_symlink_fd(session->dir,
 								"stdin",
-								getpid(), 0);
+								tty_pid, tty_fds[0]);
 			if (ret < 0)
 				goto err;
 			ret = flux_runc_exec_session_symlink_fd(session->dir,
 								"stdout",
-								getpid(), 1);
+								tty_pid, tty_fds[1]);
 			if (ret < 0)
 				goto err;
 			ret = flux_runc_exec_session_symlink_fd(session->dir,
 								"stderr",
-								getpid(), 2);
+								tty_pid, tty_fds[2]);
 			if (ret < 0)
 				goto err;
 		} else {
@@ -1168,9 +1451,6 @@ static int flux_runc_exec_serialize(struct flux_exec_slot *slot,
 		slot->gid = (uint32_t)spec->gid;
 	}
 	slot->session_id = spec->session_id;
-	if (spec->detach)
-		slot->flags |= FLUX_EXEC_F_DETACH;
-
 	slot->data_len = (uint32_t)off;
 	return 0;
 }
@@ -1307,7 +1587,10 @@ int flux_runc_cmd_exec(int argc, char **argv)
 {
 	struct flux_runc_exec_cmd cmd;
 	struct flux_runc_exec_spec spec = { 0 };
-	struct flux_runc_exec_session session = { 0 };
+	struct flux_runc_exec_session session = {
+		.tty_master_fd = -1,
+		.tty_slave_fd = -1,
+	};
 	struct flux_runc_state state;
 	struct flux_exec_ring *ring = NULL;
 	struct flux_exec_slot *slot;
@@ -1320,11 +1603,15 @@ int flux_runc_cmd_exec(int argc, char **argv)
 	uint64_t seq = 0;
 	int status = EXIT_FAILURE;
 	bool cleanup_session = false;
+	bool proxy_child = false;
+	int proxy_notify_fd = -1;
 	int ret;
 
 	ret = flux_runc_parse_exec_command(argc, argv, &cmd);
-	if (ret < 0)
+	if (ret < 0) {
+		flux_runc_set_error("invalid flux-runc exec command line");
 		return EXIT_FAILURE;
+	}
 
 	flux_runc_state_reset(&state);
 	ret = flux_runc_state_load(&state, cmd.container_id);
@@ -1338,15 +1625,23 @@ int flux_runc_cmd_exec(int argc, char **argv)
 	if (ret < 0)
 		goto out;
 	if (state.status != FLUX_RUNC_RUNNING) {
+		flux_runc_set_error("container %s is not running", state.id);
 		FLUX_LOG(FLUX_LOG_ERR, "container %s is not running\n",
 			 state.id);
 		ret = -EINVAL;
 		goto out;
 	}
 	if (!state.exec_ring_name) {
+		flux_runc_set_error("container %s has no exec ring", state.id);
 		FLUX_LOG(FLUX_LOG_ERR, "container %s has no exec ring\n",
 			 state.id);
 		ret = -EINVAL;
+		goto out;
+	}
+
+	ret = flux_runc_cgroup_join(&state, getpid());
+	if (ret < 0) {
+		flux_runc_log_errno("failed to join container cgroup", ret);
 		goto out;
 	}
 
@@ -1362,12 +1657,113 @@ int flux_runc_cmd_exec(int argc, char **argv)
 		goto out;
 	}
 
+	if (cmd.detach) {
+		int pipefd[2];
+		pid_t proxy_pid;
+
+		if (pipe2(pipefd, O_CLOEXEC) < 0) {
+			ret = -errno;
+			flux_runc_log_errno("failed to create exec proxy pipe", ret);
+			goto out;
+		}
+
+		proxy_pid = fork();
+		if (proxy_pid < 0) {
+			ret = -errno;
+			close(pipefd[0]);
+			close(pipefd[1]);
+			flux_runc_log_errno("failed to fork exec proxy", ret);
+			goto out;
+		}
+
+		if (proxy_pid > 0) {
+			int ready_status = -EIO;
+			int wait_status;
+
+			close(pipefd[1]);
+			ret = flux_runc_exec_write_pid_file(cmd.pid_file,
+							 proxy_pid);
+			if (ret < 0) {
+				kill(proxy_pid, SIGKILL);
+				while (waitpid(proxy_pid, &wait_status, 0) < 0 &&
+				       errno == EINTR)
+					;
+				close(pipefd[0]);
+				flux_runc_log_errno("failed to write exec proxy pid", ret);
+				goto out;
+			}
+
+			ret = flux_runc_exec_proxy_read_status(pipefd[0],
+							  &ready_status);
+			close(pipefd[0]);
+			if (ret < 0 || ready_status < 0) {
+				if (ret < 0)
+					kill(proxy_pid, SIGKILL);
+				while (waitpid(proxy_pid, &wait_status, 0) < 0 &&
+				       errno == EINTR)
+					;
+				if (cmd.pid_file)
+					(void)unlink(cmd.pid_file);
+				if (ret >= 0)
+					ret = ready_status;
+				flux_runc_log_errno("exec proxy failed to start", ret);
+				goto out;
+			}
+
+			ret = 0;
+			goto out;
+		}
+
+		close(pipefd[0]);
+		proxy_child = true;
+		proxy_notify_fd = pipefd[1];
+		cmd.pid_file = NULL;
+	}
+
+	if (spec.terminal && cmd.console_socket) {
+		ret = flux_runc_console_open_detached_pty(&session.tty_master_fd,
+							 &session.tty_slave_fd);
+		if (ret < 0) {
+			flux_runc_log_errno("failed to allocate exec pty", ret);
+			goto out;
+		}
+		if (spec.has_console_size) {
+			ret = flux_runc_console_set_size(session.tty_slave_fd,
+							 spec.console_width,
+							 spec.console_height);
+			if (ret < 0) {
+				flux_runc_log_errno("failed to size exec pty", ret);
+				goto out;
+			}
+		}
+	} else if (!spec.terminal && cmd.console_socket) {
+		ret = -EINVAL;
+		flux_runc_log_errno("console socket requires terminal exec", ret);
+		goto out;
+	}
+
 	ret = flux_runc_exec_session_create(&state, &spec, &session);
 	if (ret < 0) {
 		flux_runc_log_errno("failed to create exec session", ret);
 		goto out;
 	}
 	cleanup_session = session.active;
+
+	if (session.tty_master_fd >= 0) {
+		ret = flux_runc_console_send_fd(cmd.console_socket,
+						 session.tty_master_fd);
+		if (ret < 0) {
+			flux_runc_log_errno("failed to send exec pty", ret);
+			goto out;
+		}
+		close(session.tty_master_fd);
+		session.tty_master_fd = -1;
+		if (proxy_child) {
+			ret = flux_runc_exec_proxy_detach_stdio();
+			if (ret < 0)
+				goto out;
+		}
+	}
 
 	lock_fd = flux_runc_exec_lock_open(&state);
 	if (lock_fd < 0) {
@@ -1412,25 +1808,21 @@ int flux_runc_cmd_exec(int argc, char **argv)
 
 	value.sival_int =
 		flux_signal_ctrl_pack(FLUX_SIGNAL_CTRL_EXEC, 0, slot_idx);
-	if (sigqueue(target_pid, SIGUSR1, value) < 0) {
+	if (sigqueue(target_pid, FLUX_SIGNAL_CTRL_DOORBELL, value) < 0) {
 		ret = -errno;
 		flux_runc_exec_unpublish_slot(ring, slot_idx);
 		flux_runc_log_errno("failed to doorbell exec worker", ret);
 		goto out;
 	}
+	if (proxy_child)
+		flux_runc_exec_proxy_notify(&proxy_notify_fd, 0);
 
-	if (cmd.pid_file) {
+	if (cmd.pid_file && !proxy_child) {
 		ret = flux_runc_exec_write_pid_file(cmd.pid_file, getpid());
 		if (ret < 0) {
 			flux_runc_log_errno("failed to write exec pid file", ret);
 			goto out;
 		}
-	}
-
-	if (spec.detach) {
-		cleanup_session = false;
-		ret = 0;
-		goto out;
 	}
 
 	ret = flux_runc_exec_wait_slot(ring, slot_idx, seq, wait_timeout_ms,
@@ -1443,6 +1835,9 @@ int flux_runc_cmd_exec(int argc, char **argv)
 
 	ret = status;
 out:
+	if (proxy_child && proxy_notify_fd >= 0)
+		flux_runc_exec_proxy_notify(&proxy_notify_fd,
+						    ret < 0 ? ret : -EIO);
 	if (cleanup_session)
 		flux_runc_exec_session_destroy(&session);
 	flux_runc_unload();
@@ -1452,6 +1847,8 @@ out:
 	flux_runc_exec_spec_fini(&spec);
 	flux_runc_state_fini(&state);
 	free(cmd.env);
+	if (proxy_child)
+		_exit(ret < 0 ? EXIT_FAILURE : ret);
 	if (ret < 0)
 		return EXIT_FAILURE;
 	return ret;

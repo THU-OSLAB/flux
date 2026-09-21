@@ -1191,7 +1191,6 @@ out_set:
 			sigaddset(signal, sig);
 		}
 	}
-
 	complete_signal(sig, t, type);
 ret:
 	trace_signal_generate(sig, info, t, type != PIDTYPE_PID, result);
@@ -2857,7 +2856,6 @@ relock:
 		spin_unlock_irq(&sighand->siglock);
 		if (unlikely(cgroup_task_frozen(current)))
 			cgroup_leave_frozen(true);
-
 		/*
 		 * Anything else is fatal, maybe with a core dump.
 		 */

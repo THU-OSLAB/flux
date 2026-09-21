@@ -1,8 +1,7 @@
-#ifndef _FLUX_UINTR_H
-#define _FLUX_UINTR_H
+#ifndef _FLUX_KMOD_UINTR_H
+#define _FLUX_KMOD_UINTR_H
 
-#define X86_FEATURE_UINTR (18 * 32 + 5) /* User Interrupts support */
-#define DISABLE_UINTR (1 << (X86_FEATURE_UINTR & 31))
+#include <flux/host_abi.h>
 
 /* User Interrupt interface */
 #define MSR_IA32_UINTR_RR 0x985
@@ -48,20 +47,6 @@ struct uintr_uitt_entry {
 	__u64 target_upid_addr;
 } __packed __aligned(16);
 
-struct uintr_upid {
-	union {
-		struct {
-			__u8 status; /* bit 0: ON, bit 1: SN, bit 2-7: reserved */
-			__u8 reserved1; /* Reserved */
-			__u8 nv; /* Notification vector */
-			__u8 reserved2; /* Reserved */
-			__u32 ndst; /* Notification destination */
-		} nc __packed; /* Notification control */
-		long unsigned int word_val;
-	};
-	__u64 puir; /* Posted user interrupt requests */
-} __aligned(64);
-
 #define XFEATURE_UINTR 14
 #define XFEATURE_MASK_UINTR (1 << XFEATURE_UINTR)
 
@@ -72,11 +57,40 @@ struct uintr_upid {
 /* Use KVM's posted interrupt vector */
 #define UIPI_APIC_VECTOR POSTED_INTR_WAKEUP_VECTOR
 
-#define MAX_NR_USER_VEC 16
-#define UINTR_MAX_SIGNAL_NEST 64
+#define UINTR_SIGNAL_SLOT_NONE FLUX_SIGNAL_STACK_SLOTS
+#define UINTR_SIGNAL_SLOT_OVERFLOW (FLUX_SIGNAL_STACK_SLOTS + 1)
 
+enum uintr_signal_phase {
+	UINTR_SIGNAL_FREE,
+	UINTR_SIGNAL_CAPTURED,
+	UINTR_SIGNAL_MPK_BUILDING,
+	UINTR_SIGNAL_FRAME_READY,
+	UINTR_SIGNAL_ACTIVE,
+};
+
+struct uintr_signal_record {
+	struct task_struct *task;
+	unsigned long frame;
+	unsigned long stack_start;
+	unsigned long stack_size;
+	void __user *fpstate;
+	unsigned int fpstate_size;
+	u32 expected_pkru;
+	enum uintr_signal_phase phase;
+	bool uif;
+	/* Receiver bits captured for a possible hardware frame-store fault. */
+	u64 frame_fault_uirr;
+};
+
+#define MAX_NR_USER_VEC 16
 struct uintr_ctx {
 	unsigned long handler;
+	unsigned long synthetic_handler;
+	unsigned long host_fsbase;
+	unsigned long signal_stack;
+	unsigned long signal_handler;
+	unsigned long signal_stack_slot_size;
+	int logical_cpu;
 	struct kref refcount;
 	bool is_admin;
 
@@ -93,26 +107,34 @@ struct uintr_percpu {
 	struct task_struct *assigned_task;
 	struct uintr_ctx *assigned_ctx;
 
-	bool state_loaded;
+	/* Full receiver image; signal handlers retain only sender state. */
+	bool receiver_loaded;
 	bool is_admin_ctx;
+	u8 rt_sigreturn_slot;
+	u8 sig_building_slot;
 	struct uintr_xstate cur_xstate;
-	
-	long syscall_nr;
-	u8 sig_uif_stack[UINTR_MAX_SIGNAL_NEST];
+
+	struct uintr_signal_record *sig_records;
 	u8 sig_uif_depth;
 };
 
 extern void uintr_cleanup_core(struct uintr_percpu *p, int cpu);
+extern bool uintr_complete_signal_frame(unsigned long frame,
+					bool *captured_uif,
+					int *logical_cpu,
+					unsigned long *host_fsbase);
+extern long uintr_take_frame_fault(unsigned long frame);
+extern void uintr_reclear_signal_uif(void);
+extern void uintr_begin_rt_sigreturn(unsigned long frame);
+extern void uintr_complete_rt_sigreturn(unsigned long return_ip);
 extern void uintr_assign_core(struct uintr_ctx *ctx, u64 stack);
 
 extern void uintr_deliver_ipi(struct uintr_percpu *p);
 
 extern int uintr_init(void);
 extern void uintr_exit(void);
-extern long uintr_setup_percpu(struct file *filp, unsigned long handler);
+extern long uintr_setup_percpu(struct file *filp, unsigned long arg);
 extern void uintr_file_release(struct file *filp);
-
-extern bool uintr_enabled;
 
 static inline struct uintr_ctx *to_uintr_ctx(struct file *filp)
 {
@@ -129,4 +151,4 @@ static inline void uintr_signal_self(void)
 	apic->send_IPI_self(UIPI_APIC_VECTOR);
 }
 
-#endif /* _FLUX_UINTR_H */
+#endif /* _FLUX_KMOD_UINTR_H */

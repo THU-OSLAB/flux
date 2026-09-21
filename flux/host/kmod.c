@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -9,15 +10,25 @@
 
 struct flux_shm *flux_shm;
 
-#ifdef CONFIG_FLUX_UINTR
 static __thread int flux_uintr_fd = -1;
-#endif
 
-int flux_kmod_init_percpu(void *handler)
+int flux_kmod_init_percpu(void *handler, void *synthetic_handler,
+			  int logical_cpu,
+			  unsigned long host_fsbase, void *signal_stack,
+			  size_t signal_stack_slot_size)
 {
-#ifdef CONFIG_FLUX_UINTR
 	int err, fd;
+	struct flux_uintr_setup setup = {
+		.handler = (uintptr_t)handler,
+		.synthetic_handler = (uintptr_t)synthetic_handler,
+		.host_fsbase = host_fsbase,
+		.signal_stack = (uintptr_t)signal_stack,
+		.signal_stack_slot_size = signal_stack_slot_size,
+		.logical_cpu = logical_cpu,
+	};
 
+	if (!signal_stack || !signal_stack_slot_size)
+		return -1;
 	if (flux_uintr_fd >= 0)
 		return 0;
 
@@ -28,7 +39,7 @@ int flux_kmod_init_percpu(void *handler)
 		return -1;
 	}
 
-	err = ioctl(fd, FLUX_DEV_IO_UINTR_SETUP, handler);
+	err = ioctl(fd, FLUX_DEV_IO_UINTR_SETUP, &setup);
 	if (err < 0) {
 		FLUX_LOG(FLUX_LOG_ERR, "failed to setup uintr per-cpu data\n");
 		close(fd);
@@ -38,14 +49,12 @@ int flux_kmod_init_percpu(void *handler)
 	FLUX_LOG(FLUX_LOG_DEBUG, "uintr enabled\n");
 	/* keep fd open while this thread is active */
 	flux_uintr_fd = fd;
-#endif
 
 	return 0;
 }
 
 int flux_kmod_exit_percpu(void)
 {
-#ifdef CONFIG_FLUX_UINTR
 	if (flux_uintr_fd >= 0) {
 		if (close(flux_uintr_fd) < 0) {
 			FLUX_LOG(FLUX_LOG_ERR,
@@ -54,7 +63,6 @@ int flux_kmod_exit_percpu(void)
 		}
 		flux_uintr_fd = -1;
 	}
-#endif
 
 	return 0;
 }
@@ -101,8 +109,6 @@ int flux_kmod_disable_mmap_hooks(void)
 		close(fd);
 		return -1;
 	}
-
-	ioctl(fd, FLUX_DEV_IO_DUMP_VMAS);
 
 	close(fd);
 

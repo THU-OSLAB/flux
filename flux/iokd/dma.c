@@ -1,6 +1,5 @@
 #define FLUX_FMT "iokd-dma: "
 
-#include <errno.h>
 #include <string.h>
 
 #include <rte_dev.h>
@@ -9,7 +8,6 @@
 #include <utils/base.h>
 #include <utils/log.h>
 
-#include "dpdk_errno.h"
 #include "iokd.h"
 
 int flux_iok_dma_map(struct flux_iok_ctrl *ctrl, void *buf, size_t len,

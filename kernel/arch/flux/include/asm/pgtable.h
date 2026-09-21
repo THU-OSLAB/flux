@@ -3,34 +3,43 @@
 #define _ASM_FLUX_PGTABLE_H
 
 #include <asm/page.h>
-#include <asm-generic/pgtable-nopud.h>
+
+/* ---- Real MMU 4-level page tables (P4D folded, real PUD) ---- */
+#include <asm-generic/pgtable-nop4d.h>
+#include <asm/pgtable-mmu.h>
 #include <asm/processor.h>
 #include <asm/io.h>
 
-#define pgd_present(pgd) (1)
-#define pgd_none(pgd) (0)
-#define pgd_bad(pgd) (0)
-#define pgd_clear(pgdp)
-#define kern_addr_valid(addr) (1)
-#define pmd_offset(a, b) ((void *)0)
+#ifndef PFN_PTE_SHIFT
+#define PFN_PTE_SHIFT		PAGE_SHIFT
+#endif
 
-#define PAGE_NONE __pgprot(0)
-#define PAGE_SHARED __pgprot(0)
-#define PAGE_COPY __pgprot(0)
-#define PAGE_READONLY __pgprot(0)
-#define PAGE_KERNEL __pgprot(1 << 0)
+struct mm_struct;
+bool flux_rewrite_range_busy(struct mm_struct *mm, unsigned long start,
+                             unsigned long end);
+#define arch_preserve_user_mapping flux_rewrite_range_busy
 
+int arch_prepare_mmap(unsigned long addr, unsigned long len, unsigned long flags);
+#define arch_prepare_mmap arch_prepare_mmap
+struct vm_area_struct;
+void arch_complete_mmap(struct vm_area_struct *vma);
+#define arch_complete_mmap arch_complete_mmap
+
+/* x86 hardware pte flag, only used when writing host page tables. */
+#ifndef _PAGE_GLOBAL
+#define _PAGE_GLOBAL		0x800
+#endif
+
+extern void *empty_zero_page;
 void paging_init(void);
-#define swapper_pg_dir ((pgd_t *)0)
 
-#define __swp_type(x) (0)
-#define __swp_offset(x) (0)
-#define __swp_entry(typ, off) ((swp_entry_t){ ((typ) | ((off) << 7)) })
-#define __pte_to_swp_entry(pte) ((swp_entry_t){ pte_val(pte) })
-#define __swp_entry_to_pte(x) ((pte_t){ (x).val })
+static inline void set_pte(pte_t *pteptr, pte_t pteval)
+{
+	__set_pte(pteptr, pteval);
+}
 
-#define PTRS_PER_PTE 0
-#define PTRS_PER_PMD 0
+#define pte_flags(pte)		(pte_val(pte) & ~PAGE_MASK)
+#define pte_pgprot(pte)		__pgprot(pte_flags(pte))
 
 #define arch_supports_memmap_on_memory arch_supports_memmap_on_memory
 static inline bool arch_supports_memmap_on_memory(unsigned long vmemmap_size)
@@ -38,16 +47,7 @@ static inline bool arch_supports_memmap_on_memory(unsigned long vmemmap_size)
 	return false;
 }
 
-/*
- * ZERO_PAGE is a global shared page that is always zero: used
- * for zero-mapped memory areas etc..
- */
-extern void *empty_zero_page;
-
-/*
- * ZERO_PAGE is a global shared page that is always zero: used
- * for zero-mapped memory areas etc..
- */
 #define ZERO_PAGE(vaddr) virt_to_page(empty_zero_page)
+
 
 #endif /* _ASM_FLUX_PGTABLE_H */
